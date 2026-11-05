@@ -84,7 +84,9 @@ Dynamo workers on Karpenter inference nodes (Dynamo mocker in v1, vLLM later)
 
 The Dynamo frontend and KV Router always run in the same cluster as the workers they route to.
 
-All EKS API endpoints are **private only**. Operators reach them from inside the VPC (operator-managed SSM Session Manager tunnel; the operator instance is created manually and is not part of this repository).
+All EKS API endpoints are **private only**. Operators reach them from inside the VPC (operator-managed SSM Session Manager tunnel; the operator instance is created manually and is not part of this repository). Because the operator instance sits in the Region VPC, the teardown script terminates it before `terraform destroy` deletes the VPC.
+
+Cell AZs are fixed at first deploy: subnet CIDRs are numbered by the position of each AZ in the sorted AZ list, so moving a cell to another AZ means tearing the Region environment down and deploying it again.
 
 All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper around `terraform-aws-modules/eks`): private endpoint, EKS access entries, pinned add-ons, and the system managed node group.
 
@@ -96,7 +98,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 - Cells are identical. They are created from one reusable Terraform `cell` module with these inputs: `region`, `availability_zone`, `cell_id`, `inference_instance_type`, `efa_enabled`.
 - Each cell contains:
   - **System node group:** EKS managed node group, latest-generation x86 `c` instances, EKS-optimized AL2023 AMI. Runs cluster add-ons, Karpenter, AWS Load Balancer Controller, and the Dynamo platform (operator, frontend, KV Router). Dynamo uses its defaults: Kubernetes-native worker discovery, TCP request plane, and ZMQ event plane for KV events. No etcd and no NATS. Frontend replicas run with router replica sync enabled.
-  - **Karpenter inference nodes:** a Karpenter NodePool pinned to the cell's AZ, EKS-optimized AL2023 AMI, running all inference workers. Instance type is a parameter: `c8i.48xlarge` (CPU, EFA-capable) in v1, P5 family later. The inference EC2NodeClass and NodePool are rendered by the Terraform `cell` module. They use the same pinned AMI release as the system node groups (as the Karpenter alias `al2023@v<date>`).
+  - **Karpenter inference nodes:** a Karpenter NodePool pinned to the cell's AZ, EKS-optimized AL2023 AMI, running all inference workers. Instance type is a parameter: `c8i.48xlarge` (CPU, EFA-capable) in v1, or `c7i.48xlarge` (same vCPU count and EFA layout) where `c8i.48xlarge` has no on-demand capacity in the cell's AZ; P5 family later. The inference EC2NodeClass and NodePool are rendered by the Terraform `cell` module. They use the same pinned AMI release as the system node groups (as the Karpenter alias `al2023@v<date>`).
   - **Inference workers:** aggregated serving, with prefill and decode in the same worker (Dynamo component type `worker`).
 
 ---
@@ -111,7 +113,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
   - Subnets in at least the cell AZs, and at least two AZs for EKS control planes and the ALB.
 - **NAT gateway** per used AZ for outbound image/model pulls. VPC endpoints for ECR (api, dkr), S3 (gateway), STS, EC2, SSM, ssmmessages, ec2messages, EKS, EKS Auth (Pod Identity). Interface endpoints are placed in the cell AZs only.
 - **Pod networking:** Amazon VPC CNI with **prefix delegation** enabled. Pod IPs come only from the primary (ENA) network interfaces.
-- **EFA on inference nodes:** the primary network interface (network card 0, device index 0) is an ENA interface carrying IPv4 node and pod traffic. All additional interfaces are **EFA-only** interfaces (no IP addresses, RDMA only), up to the instance type's maximum. For `c8i.48xlarge` this is one EFA-only interface (network card 0, device index 1). Interfaces are configured through Karpenter `EC2NodeClass.networkInterfaces`. EFA devices are exposed to pods through the **EFA Kubernetes device plugin** as the `vpc.amazonaws.com/efa` resource. Inference nodes run in a **cluster placement group** per cell (Karpenter `placementGroupSelector`). Security group allows all traffic to and from itself (EFA requirement).
+- **EFA on inference nodes:** the primary network interface (network card 0, device index 0) is an ENA interface carrying IPv4 node and pod traffic. All additional interfaces are **EFA-only** interfaces (no IP addresses, RDMA only), up to the instance type's maximum. For `c8i.48xlarge` and `c7i.48xlarge` this is one EFA-only interface (network card 0, device index 1). Interfaces are configured through Karpenter `EC2NodeClass.networkInterfaces`. EFA devices are exposed to pods through the **EFA Kubernetes device plugin** as the `vpc.amazonaws.com/efa` resource. Inference nodes run in a **cluster placement group** per cell (Karpenter `placementGroupSelector`). Security group allows all traffic to and from itself (EFA requirement).
 - **IAM for in-cluster controllers:** EKS Pod Identity (`eks-pod-identity-agent` add-on on every cluster). No IRSA / OIDC trust policies.
 - **Load balancers:**
   - Public ALB, its listener, ACM certificate, JWT verification rule, and target group are created by **Terraform**. Router pods are registered into the target group by the **AWS Load Balancer Controller** via `TargetGroupBinding` (IP targets).
@@ -150,7 +152,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 | Non-EKS EC2 instances | Ubuntu Server 26.04 LTS |
 | Node provisioning | Karpenter (AZ-pinned inference NodePool), EKS managed node group for system nodes |
 | Controller IAM | EKS Pod Identity |
-| Inference instances | Parameterized: `c8i.48xlarge` with EFA in v1, P5 family later |
+| Inference instances | Parameterized: `c8i.48xlarge` with EFA in v1 (`c7i.48xlarge` where c8i capacity is unavailable), P5 family later |
 | RDMA | EFA (EFA-only secondary interfaces) + EFA Kubernetes device plugin |
 | Pod networking | Amazon VPC CNI with prefix delegation |
 | Model storage | Amazon S3 (source of truth) — used from Phase 2 |
@@ -159,7 +161,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 | Container registry | Amazon ECR: `router` repo (plain image) and a `dynamo-planner` mirror repo (with SOCI index) |
 | Infrastructure as code | Terraform, local state |
 | Logs and metrics | Amazon CloudWatch (default EKS/EC2/ALB/NLB integration only) |
-| Deployment | Manual: Terraform from the operator host; Helm/`kubectl` through the SSM tunnel |
+| Deployment | Numbered scripts run from the operator host, one by one or unattended in order by `scripts/deploy.sh` (per-step timestamped logs, retries, tunnel keepalive): Terraform, then Helm/`kubectl` through the SSM tunnel |
 
 ---
 
@@ -211,7 +213,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 ## 11. Stub Milestone: Definition of Done
 
 1. `terraform apply` for one Region creates: VPC, ACM certificate, Cognito user pool and app client, public ALB, Route 53 record, ECR repositories, the regional router cluster, and **two cells** in two different AZs.
-2. The Dynamo mocker runs on Karpenter inference nodes (`c8i.48xlarge`, EFA interfaces attached and visible as `vpc.amazonaws.com/efa` on the node) in each cell, behind the Dynamo frontend.
+2. The Dynamo mocker runs on Karpenter inference nodes (the configured inference instance type, `c8i.48xlarge` or `c7i.48xlarge`; EFA interfaces attached and visible as `vpc.amazonaws.com/efa` on the node) in each cell, behind the Dynamo frontend.
 3. SOCI is active on the inference nodes: the mocker pod's image (from the ECR `dynamo-planner` mirror with a SOCI index) is lazy-loaded, verified with `findmnt --source soci` on the node through SSM.
 4. `curl https://<api_hostname>/v1/chat/completions` with a valid Cognito access token and `"stream": true` returns OpenAI-format SSE chunks ending with `data: [DONE]`.
 5. Repeated requests with the same `session-id` always return the same `x-served-cell`.

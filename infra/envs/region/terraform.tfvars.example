@@ -8,6 +8,9 @@ vpc_cidr = "10.0.0.0/16"
 
 # Two cells, each pinned to a different Availability Zone of the Region.
 cells = {
+# Pick AZs with on-demand capacity for the inference instance type. Changing
+# a cell's AZ after the first apply requires a teardown and a new deploy.
+# c7i.48xlarge has the same EFA layout and can replace c8i.48xlarge.
   a = {
     availability_zone       = "<region>a"
     inference_instance_type = "c8i.48xlarge"

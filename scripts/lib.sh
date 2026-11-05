@@ -13,9 +13,10 @@ source "${SCRIPTS_DIR}/versions.env"
 
 mkdir -p "${STATE_DIR}"
 
-log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*" >&2; }
-ok() { printf '\033[1;32m  ok\033[0m  %s\n' "$*" >&2; }
-fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { printf '\n\033[1;34m==> [%s] %s\033[0m\n' "$(ts)" "$*" >&2; }
+ok() { printf '\033[1;32m  ok\033[0m  [%s] %s\n' "$(ts)" "$*" >&2; }
+fail() { printf '\033[1;31mFAIL\033[0m  [%s] %s\n' "$(ts)" "$*" >&2; }
 die() { fail "$*"; exit 1; }
 
 require() {
