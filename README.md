@@ -24,10 +24,11 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
 | `docs/architecture.md` | Architecture snapshot (the source of truth) |
 | `infra/modules/network` | VPC, /18 private and /24 public subnets per AZ, NAT gateway per AZ, VPC endpoints |
 | `infra/modules/edge` | ACM certificate, Cognito (client credentials), public ALB with JWT validation, Route 53 latency record |
-| `infra/modules/regional` | Regional router EKS cluster, ECR repositories (`router`, `dynamo-planner`), controller IAM (IRSA) |
-| `infra/modules/cell` | One cell: EKS cluster in one AZ, system node group, Karpenter IAM/SQS, placement group, EFA security group |
+| `infra/modules/eks-base` | Shared EKS settings for every cluster (wrapper around `terraform-aws-modules/eks`): private endpoint, access entries, pinned add-ons including the Pod Identity Agent, system node group |
+| `infra/modules/regional` | Regional router cluster (on `eks-base`), ECR repositories (`router`, `dynamo-planner`), Load Balancer Controller IAM (Pod Identity) |
+| `infra/modules/cell` | One cell: cluster in one AZ (on `eks-base`), Karpenter IAM/SQS (Pod Identity), placement group, EFA security group, and the rendered inference EC2NodeClass + NodePool |
 | `infra/envs/region` | One Region environment that lists the cells (`terraform.tfvars.example`) |
-| `platform/` | Helm values and manifests: Load Balancer Controller, Karpenter (EC2NodeClass + inference NodePool), EFA device plugin, Dynamo, SOCI |
+| `platform/` | Helm values and templates: Load Balancer Controller, Karpenter (EC2NodeClass + inference NodePool templates, rendered by Terraform), EFA device plugin, Dynamo, SOCI node config for inference nodes |
 | `router/` | Regional router (FastAPI + uvicorn + httpx), tests, Dockerfile, Kubernetes manifests |
 | `workloads/stub-engine` | `DynamoGraphDeployment` (frontend + mocker) and the internal NLB Service |
 | `workloads/vllm` | Placeholder for Phase 2 |
@@ -46,7 +47,7 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
 
 ### Operator host
 
-The operator host is the machine where you run Terraform and the scripts. It must be Linux on x86_64, because the SOCI conversion needs containerd. It needs these tools:
+The operator host is the machine where you run Terraform and the scripts. It must be Linux on x86_64, because the SOCI conversion of the `dynamo-planner` image needs containerd. It needs these tools:
 
 | Tool | Version used |
 |---|---|
@@ -55,7 +56,7 @@ The operator host is the machine where you run Terraform and the scripts. It mus
 | kubectl | 1.36 or later (clusters run Kubernetes 1.37) |
 | Helm | 3.x (3.19 tested) |
 | Docker (with buildx) | current, to build the router image |
-| containerd 2.x + nerdctl | to pull, convert and push images (run with `sudo`) |
+| containerd 2.x + nerdctl | to pull, convert and push the `dynamo-planner` mirror (run with `sudo`) |
 | `soci` CLI | 0.16.1 (from the [soci-snapshotter release](https://github.com/awslabs/soci-snapshotter/releases/tag/v0.16.1)) |
 | jq, curl, git, envsubst (gettext), setsid (util-linux) | any |
 | Python 3.11+ with `openai==3.46.0` | for DoD 7 |
@@ -98,9 +99,9 @@ Run the steps from the repository root. Each step can be re-run.
 | 1 | `scripts/10-terraform-apply.sh` | `terraform apply` creates the VPC, ACM, Cognito, ALB, Route 53 record, ECR, the router cluster and both cells (about 30 min) |
 | – | *create the operator instance* | See [Operator instance](#operator-instance-ssm-tunnel) |
 | 2 | `OPERATOR_INSTANCE_ID=i-… scripts/20-tunnels.sh start` | Opens SSM tunnels and writes `.state/region/kubeconfig` with one context per cluster |
-| 3 | `scripts/30-images.sh` | Builds the router image and mirrors `dynamo-planner:1.6.1` from NGC. Converts both to SOCI-enabled images (index manifest v2) and pushes them to ECR |
+| 3 | `scripts/30-images.sh` | Builds and pushes the router image with Docker (git-SHA tag). Mirrors `dynamo-planner:1.6.1` from NGC, converts it to a SOCI-enabled image (index manifest v2) and pushes it to ECR |
 | 4 | `scripts/40-platform-router.sh` | AWS Load Balancer Controller on the router cluster |
-| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter with the inference EC2NodeClass and NodePool, EFA device plugin, Dynamo platform (operator + NATS) |
+| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter, `kubectl apply` of the EC2NodeClass and NodePool that Terraform rendered, EFA device plugin, Dynamo platform (operator + NATS) |
 | 6 | `scripts/50-stub-engine.sh` | Per cell: the `DynamoGraphDeployment` (frontend + KV Router + mocker) and the internal NLB. Karpenter launches the inference node (about 10 min) |
 | 7 | `scripts/60-router.sh` | Router ConfigMaps (cell list = internal NLB URLs), Deployment and TargetGroupBinding. Waits for healthy ALB targets |
 | 8 | `scripts/70-verify.sh` | Runs every DoD check below |
@@ -149,7 +150,7 @@ for c in a b; do
 done
 ```
 
-Each cell shows a `c8i.48xlarge` node in its own AZ with `EFA` = `1`. The `decode` (mocker) pods run on that node, and the `frontend` pods run on system nodes.
+Each cell shows a `c8i.48xlarge` node in its own AZ with `EFA` = `1`. The `worker` (mocker) pods run on that node, and the `frontend` pods run on system nodes.
 
 ### 3. SOCI lazy-loads the mocker image
 
@@ -162,6 +163,8 @@ sleep 5; aws ssm get-command-invocation --command-id $CMD --instance-id $INSTANC
 ```
 
 The output lists `fuse.rawBridge` mounts under `/var/lib/soci-snapshotter-grpc/`, one for each lazily loaded layer of `…/dynamo-planner:1.6.1-soci`.
+
+SOCI runs only on inference nodes. They use the snapshotter that ships in the AL2023 AMI, enabled by the nodeadm `FastImagePull` feature gate (`platform/soci/nodeconfig.yaml`). That gate configures SOCI for parallel pull, which never lazy-loads, so `platform/soci/lazy-loading.sh` turns parallel pull off at boot. If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
 
 ### 4. Streaming returns OpenAI SSE chunks ending with `data: [DONE]`
 
@@ -246,7 +249,7 @@ The ALB rejects these requests before they reach the cluster. The router checks 
 | Behavior | Detail |
 |---|---|
 | Endpoints | `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, plus `GET /healthz` for the ALB health check |
-| Authentication | The Cognito access token must have a valid RS256 signature (checked against the JWKS), the right `iss`, an unexpired `exp`, `token_use=access`, and the required scope |
+| Authentication | The Cognito access token must have a valid RS256 signature, the right `iss`, an unexpired `exp`, `token_use=access`, and the required scope. Signing keys come from PyJWT's `PyJWKClient` (cached). An unreachable JWKS endpoint returns `503` |
 | Cell selection | `int(sha256(session-id)) mod N`, over the cell order in the `router-cells` ConfigMap. Append new cells at the end. Changing the list remaps some sessions, which then start cold in their new cell |
 | Proxying | Raw bytes are passed through as they arrive, so SSE is not buffered. `Authorization` is not forwarded to cells. The router adds `x-served-region` and `x-served-cell` |
 
@@ -259,7 +262,7 @@ pip install -e '.[test]'
 pytest
 ```
 
-The tests cover routing determinism (including independence from `PYTHONHASHSEED`), distribution across cells, authentication, the `400` cases, SSE pass-through and response headers.
+The tests cover routing determinism (including independence from `PYTHONHASHSEED`), distribution across cells, authentication (including the `503` when the JWKS is unreachable), the `400` cases, SSE pass-through and response headers.
 
 ## Later phases need configuration changes only
 
@@ -272,16 +275,18 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 |---|---|---|
 | Terraform | 1.17.x | `infra/envs/region/versions.tf` |
 | Terraform providers | `hashicorp/aws` 6.72.0 and others | `infra/envs/region/versions.tf`, `infra/envs/region/.terraform.lock.hcl` |
-| Terraform modules | `terraform-aws-modules`: vpc 6.7.3, eks 21.29.0, iam 6.8.2 | the module sources |
-| Kubernetes, EKS add-ons, AL2023 AMI release | 1.37 | `infra/envs/region/variables.tf` |
-| Helm charts and images | LBC 3.6.2, Karpenter 1.15.1, EFA plugin v0.5.35, Dynamo 1.6.1, `dynamo-planner` by digest, AL2023 AMI alias | `scripts/versions.env` |
-| SOCI snapshotter on nodes | 0.16.1, SHA-256 verified | `platform/soci/install-soci.sh` |
+| Terraform modules | `terraform-aws-modules`: vpc 6.7.3, eks 21.29.0, eks-pod-identity 2.10.0 | the module sources |
+| Kubernetes, EKS add-ons, AL2023 AMI release (system nodes, and Karpenter nodes as `al2023@v<date>`) | 1.37, AMI `1.37.1-20261031` | `infra/envs/region/variables.tf` |
+| Helm charts and images | LBC 3.6.2, Karpenter 1.15.1, EFA plugin v0.5.35, Dynamo 1.6.1, `dynamo-planner` by digest | `scripts/versions.env` |
+| SOCI snapshotter on inference nodes | the version shipped in the pinned AMI | AMI release above |
 | Router base image | `python:3.13.18-slim-trixie` by digest | `router/Dockerfile` |
 | Router Python dependencies | exact versions | `router/pyproject.toml` |
 
 ## Notes
 
 - **Logs and metrics:** only the default CloudWatch integration is used: EKS control-plane logs plus the EC2, ALB and NLB metrics.
-- **Boot-time downloads:** every node downloads the pinned SOCI release from GitHub at boot, through the NAT gateway. The mocker downloads its tokenizer (`Qwen/Qwen3-0.6B`) from Hugging Face at startup.
+- **IAM:** in-cluster controllers (Karpenter, Load Balancer Controller) get credentials through EKS Pod Identity associations created by Terraform. The clusters have no OIDC provider.
+- **Downloads at startup:** nodes download nothing at boot. The mocker downloads its tokenizer (`Qwen/Qwen3-0.6B`) from Hugging Face at startup.
+- **Dynamo frontends:** each cell runs two frontend replicas. Each one subscribes to the workers' KV events itself (event plane, ZMQ by default), so both build the same prefix index. `DYN_ROUTER_REPLICA_SYNC=true` also shares active-request load between them.
 - **NATS:** NATS runs JetStream in memory, so the cells need no persistent volumes.
 - **EFA device plugin image:** the plugin image comes from the EKS add-on registry of the Region, account `602401143452`. Opt-in Regions use a different account; set `EKS_ADDON_REGISTRY_ACCOUNT` in `scripts/versions.env`.

@@ -3,8 +3,9 @@
 # on every cell cluster.
 #
 # Set per cluster at install time (scripts/40-*, scripts/41-*):
-#   clusterName, region, vpcId,
-#   serviceAccount.annotations."eks.amazonaws.com/role-arn" (IRSA, from Terraform)
+#   clusterName, region, vpcId
+# IAM: EKS Pod Identity association for kube-system/aws-load-balancer-controller
+# (Terraform: infra/modules/regional and infra/modules/cell).
 #
 # Router cluster: registers router pod IPs into the Terraform-owned ALB target
 # group through a TargetGroupBinding.

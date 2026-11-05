@@ -16,6 +16,11 @@ locals {
   public_subnets = [
     for i, _ in var.azs : cidrsubnet(var.vpc_cidr, local.public_newbits, pow(2, local.public_newbits) - 1 - i)
   ]
+
+  endpoint_azs = length(var.endpoint_azs) > 0 ? var.endpoint_azs : var.azs
+  endpoint_subnet_ids = [
+    for az, id in zipmap(var.azs, module.vpc.private_subnets) : id if contains(local.endpoint_azs, az)
+  ]
 }
 
 module "vpc" {
@@ -99,7 +104,7 @@ module "vpc_endpoints" {
       for svc in var.interface_endpoint_services : replace(svc, ".", "_") => {
         service             = svc
         private_dns_enabled = true
-        subnet_ids          = module.vpc.private_subnets
+        subnet_ids          = local.endpoint_subnet_ids
         tags                = { Name = "${var.name}-${svc}" }
       }
     }

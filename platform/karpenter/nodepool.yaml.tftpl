@@ -1,9 +1,6 @@
 # Inference NodePool, one per cell, pinned to the cell's Availability Zone.
-# Rendered by scripts/41-platform-cells.sh (envsubst).
-#
-# Only inference workers run here: the taint keeps everything else on the
-# system node group. The instance type comes from the cell module input
-# inference_instance_type (c8i.48xlarge in Phase 1, P5 later).
+# Rendered with templatefile() by infra/modules/cell. Only inference workers
+# run here: the taint keeps everything else on the system node group.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -13,7 +10,7 @@ spec:
     metadata:
       labels:
         llm-inference/node-class: inference
-        llm-inference/cell: "${CELL_ID}"
+        llm-inference/cell: "${cell_id}"
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws
@@ -22,10 +19,10 @@ spec:
       requirements:
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["${AVAILABILITY_ZONE}"]
+          values: ["${availability_zone}"]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: ["${INFERENCE_INSTANCE_TYPE}"]
+          values: ["${instance_type}"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: ["on-demand"]
@@ -39,7 +36,7 @@ spec:
       expireAfter: 720h
   limits:
     # Upper bound on inference capacity per cell (vCPUs across all nodes).
-    cpu: "${INFERENCE_CPU_LIMIT}"
+    cpu: "${cpu_limit}"
   disruption:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 10m

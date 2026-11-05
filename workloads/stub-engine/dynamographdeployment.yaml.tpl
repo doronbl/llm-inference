@@ -11,7 +11,9 @@ metadata:
   namespace: llm-inference
 spec:
   components:
-    # Frontend + KV Router: system node group.
+    # Frontend + KV Router: system node group. Each replica subscribes to the
+    # workers' KV events itself (event plane, ZMQ by default), so both build
+    # the same prefix index. Replica sync also shares active-request load.
     - name: Frontend
       type: frontend
       replicas: 2
@@ -25,6 +27,8 @@ spec:
               env:
                 - name: DYN_ROUTER_MODE
                   value: kv
+                - name: DYN_ROUTER_REPLICA_SYNC
+                  value: "true"
               resources:
                 requests:
                   cpu: "1"
@@ -33,9 +37,10 @@ spec:
                   memory: 8Gi
 
     # Mocker workers: Karpenter inference nodes (AZ-pinned NodePool).
-    # The mocker publishes KV events, so the frontend routes on real cache state.
-    - name: decode
-      type: decode
+    # "worker" is the aggregated component type; the mocker defaults to
+    # --disaggregation-mode agg and publishes KV events.
+    - name: worker
+      type: worker
       replicas: 2
       podTemplate:
         spec:

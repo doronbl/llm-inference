@@ -50,7 +50,7 @@ dod2_3() {
     efa_expected="$(cell_value "${id}" efa_interface_count)"
 
     nodes="$(kc "${ctx}" get pods -n llm-inference \
-      -l nvidia.com/dynamo-graph-deployment-name=stub-engine,nvidia.com/dynamo-component-type=decode \
+      -l nvidia.com/dynamo-graph-deployment-name=stub-engine,nvidia.com/dynamo-component-type=worker \
       --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u)"
     if [[ -z "${nodes}" ]]; then fail "cell ${id}: no running mocker pods"; rc=1; continue; fi
 

@@ -120,6 +120,22 @@ class FakeCells:
         )
 
 
+class FakeJWKClient(jwt.PyJWKClient):
+    """PyJWKClient that serves a fixed JWKS instead of calling the network."""
+
+    def __init__(self, jwks: dict[str, Any]) -> None:
+        super().__init__(JWKS_URL, cache_keys=True, lifespan=300)
+        self.jwks = jwks
+        self.fetches = 0
+        self.down = False
+
+    def fetch_data(self) -> Any:
+        self.fetches += 1
+        if self.down:
+            raise jwt.PyJWKClientConnectionError("JWKS endpoint unreachable")
+        return self.jwks
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
@@ -128,7 +144,6 @@ def settings() -> Settings:
         issuer=ISSUER,
         jwks_url=JWKS_URL,
         required_scope=SCOPE,
-        jwks_min_refresh_seconds=0.0,
     )
 
 
@@ -138,15 +153,16 @@ def fake_cells() -> FakeCells:
 
 
 @pytest.fixture
-def client(settings: Settings, fake_cells: FakeCells, jwks: dict[str, Any]) -> Iterator[TestClient]:
-    def jwks_handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == JWKS_URL
-        return httpx.Response(200, json=jwks)
+def jwk_client(jwks: dict[str, Any]) -> FakeJWKClient:
+    return FakeJWKClient(jwks)
 
+
+@pytest.fixture
+def client(settings: Settings, fake_cells: FakeCells, jwk_client: FakeJWKClient) -> Iterator[TestClient]:
     app = create_app(
         settings,
         upstream_transport=httpx.MockTransport(fake_cells.handler),
-        jwks_transport=httpx.MockTransport(jwks_handler),
+        jwks=jwk_client,
     )
     with TestClient(app) as test_client:
         yield test_client

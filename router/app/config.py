@@ -32,7 +32,6 @@ class Settings:
     jwks_url: str
     required_scope: str
     jwks_cache_seconds: float = 300.0
-    jwks_min_refresh_seconds: float = 30.0
     upstream_connect_timeout_seconds: float = 5.0
     upstream_write_timeout_seconds: float = 30.0
     max_upstream_connections: int = 1000

@@ -88,7 +88,7 @@ variable "kubernetes_version" {
 }
 
 variable "ami_release_version" {
-  description = "EKS-optimized AL2023 AMI release version of the system node groups."
+  description = "EKS-optimized AL2023 AMI release of all nodes: system node groups use it directly, Karpenter inference nodes as the alias al2023@v<date>."
   type        = string
   default     = "1.37.1-20261031"
 }
@@ -97,9 +97,10 @@ variable "addon_versions" {
   description = "Pinned EKS add-on versions."
   type        = map(string)
   default = {
-    "vpc-cni"    = "v1.22.4-eksbuild.10"
-    "kube-proxy" = "v1.37.0-eksbuild.32"
-    "coredns"    = "v1.14.7-eksbuild.22"
+    "eks-pod-identity-agent" = "v1.4.1-eksbuild.3"
+    "vpc-cni"                = "v1.22.4-eksbuild.10"
+    "kube-proxy"             = "v1.37.0-eksbuild.32"
+    "coredns"                = "v1.14.7-eksbuild.22"
   }
 }
 

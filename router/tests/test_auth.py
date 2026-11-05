@@ -6,7 +6,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from conftest import FakeCells
+from conftest import FakeCells, FakeJWKClient
 
 CHAT = "/v1/chat/completions"
 BODY = {"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "hi"}]}
@@ -76,6 +76,26 @@ def test_token_is_not_forwarded_to_cells(
 ) -> None:
     client.post(CHAT, json=BODY, headers=auth_headers("s1"))
     assert "authorization" not in fake_cells.requests[0].headers
+
+
+def test_signing_keys_are_cached(
+    client: TestClient, auth_headers: Callable[..., dict[str, str]], jwk_client: FakeJWKClient
+) -> None:
+    for i in range(5):
+        assert client.post(CHAT, json=BODY, headers=auth_headers(f"s{i}")).status_code == 200
+    assert jwk_client.fetches == 1
+
+
+def test_unreachable_jwks_returns_503(
+    client: TestClient, auth_headers: Callable[..., dict[str, str]], jwk_client: FakeJWKClient, fake_cells: FakeCells
+) -> None:
+    jwk_client.down = True
+    response = client.post(CHAT, json=BODY, headers=auth_headers("s1"))
+    assert response.status_code == 503
+    error = response.json()["error"]
+    assert error["type"] == "server_error"
+    assert error["code"] == "auth_unavailable"
+    assert fake_cells.requests == []
 
 
 def test_healthz_needs_no_token(client: TestClient) -> None:

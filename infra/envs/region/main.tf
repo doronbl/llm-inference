@@ -11,7 +11,8 @@ provider "aws" {
 }
 
 locals {
-  name_prefix = "${var.name}-${var.region}"
+  name_prefix  = "${var.name}-${var.region}"
+  platform_dir = "${path.module}/../../../platform"
 
   tags = merge(var.tags, {
     Project   = "llm-inference"
@@ -22,21 +23,9 @@ locals {
   cell_azs = sort([for c in values(var.cells) : c.availability_zone])
   azs      = distinct(concat(local.cell_azs, var.extra_azs))
 
-  # cloud-init parts for every EKS node: SOCI snapshotter install + its
-  # containerd/kubelet NodeConfig fragment (shared with the Karpenter EC2NodeClass).
-  soci_cloudinit_parts = [
-    {
-      content_type = "text/x-shellscript; charset=\"us-ascii\""
-      content      = file("${path.module}/../../../platform/soci/install-soci.sh")
-    },
-    {
-      content_type = "application/node.eks.aws"
-      content      = file("${path.module}/../../../platform/soci/nodeconfig.yaml")
-    },
-  ]
-
-  # Pod density on managed node groups with VPC CNI prefix delegation.
-  system_nodeconfig_part = {
+  # System managed node groups: pod density with VPC CNI prefix delegation.
+  # (SOCI is enabled on Karpenter inference nodes only; see infra/modules/cell.)
+  system_node_cloudinit_parts = [{
     content_type = "application/node.eks.aws"
     content      = <<-EOT
       ---
@@ -47,9 +36,7 @@ locals {
           config:
             maxPods: 110
     EOT
-  }
-
-  node_cloudinit_parts = concat(local.soci_cloudinit_parts, [local.system_nodeconfig_part])
+  }]
 
   router_port = 8080
 }
@@ -57,10 +44,11 @@ locals {
 module "network" {
   source = "../../modules/network"
 
-  name     = local.name_prefix
-  vpc_cidr = var.vpc_cidr
-  azs      = local.azs
-  tags     = local.tags
+  name         = local.name_prefix
+  vpc_cidr     = var.vpc_cidr
+  azs          = local.azs
+  endpoint_azs = local.cell_azs
+  tags         = local.tags
 }
 
 module "edge" {
@@ -91,7 +79,7 @@ module "regional" {
   control_plane_subnet_ids = module.network.private_subnet_ids
 
   system_instance_types = var.regional_system_instance_types
-  node_cloudinit_parts  = local.node_cloudinit_parts
+  node_cloudinit_parts  = local.system_node_cloudinit_parts
   admin_principal_arns  = var.operator_principal_arns
 
   alb_security_group_id = module.edge.alb_security_group_id
@@ -116,6 +104,7 @@ module "cell" {
   kubernetes_version  = var.kubernetes_version
   addon_versions      = var.addon_versions
   ami_release_version = var.ami_release_version
+  platform_dir        = local.platform_dir
 
   vpc_id                   = module.network.vpc_id
   vpc_cidr                 = module.network.vpc_cidr
@@ -123,7 +112,7 @@ module "cell" {
   control_plane_subnet_ids = module.network.private_subnet_ids
 
   system_instance_types = var.cell_system_instance_types
-  node_cloudinit_parts  = local.node_cloudinit_parts
+  node_cloudinit_parts  = local.system_node_cloudinit_parts
   admin_principal_arns  = var.operator_principal_arns
 
   tags = local.tags

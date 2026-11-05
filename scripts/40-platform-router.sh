@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Step 4: add-ons on the regional router cluster (AWS Load Balancer Controller).
+# IAM comes from the EKS Pod Identity association created by Terraform.
 # Requires the tunnels from scripts/20-tunnels.sh.
 source "$(dirname "$0")/lib.sh"
 require helm kubectl jq
@@ -15,6 +16,5 @@ hc "${CTX}" upgrade --install aws-load-balancer-controller eks/aws-load-balancer
   --set clusterName="${CTX}" \
   --set region="$(region)" \
   --set vpcId="$(tf_deploy '.vpc_id')" \
-  --set-string "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$(tf_deploy '.router.lbc_role_arn')" \
   --wait --timeout 10m
 ok "aws-load-balancer-controller ready"

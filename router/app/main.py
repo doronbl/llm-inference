@@ -16,10 +16,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import jwt
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
-from .auth import AuthError, JWKSCache, KeysUnavailable, TokenVerifier
+from .auth import AuthError, KeysUnavailable, TokenVerifier, jwk_client
 from .config import Cell, Settings, load_settings
 from .errors import openai_error
 from .routing import select_cell
@@ -50,9 +51,9 @@ def create_app(
     settings: Settings | None = None,
     *,
     upstream_transport: httpx.AsyncBaseTransport | None = None,
-    jwks_transport: httpx.AsyncBaseTransport | None = None,
+    jwks: jwt.PyJWKClient | None = None,
 ) -> FastAPI:
-    """Build the app. Transports are injectable for tests."""
+    """Build the app. The upstream transport and JWKS client are injectable for tests."""
 
     settings = settings or load_settings()
 
@@ -72,23 +73,16 @@ def create_app(
             ),
             follow_redirects=False,
         )
-        jwks_client = httpx.AsyncClient(transport=jwks_transport, timeout=5.0)
         app.state.upstream = upstream
         app.state.verifier = TokenVerifier(
             issuer=settings.issuer,
             required_scope=settings.required_scope,
-            jwks=JWKSCache(
-                settings.jwks_url,
-                jwks_client,
-                ttl_seconds=settings.jwks_cache_seconds,
-                min_refresh_seconds=settings.jwks_min_refresh_seconds,
-            ),
+            jwks=jwks or jwk_client(settings.jwks_url, lifespan_seconds=settings.jwks_cache_seconds),
         )
         try:
             yield
         finally:
             await upstream.aclose()
-            await jwks_client.aclose()
 
     app = FastAPI(title="llm-inference regional router", lifespan=lifespan, docs_url=None, redoc_url=None)
 

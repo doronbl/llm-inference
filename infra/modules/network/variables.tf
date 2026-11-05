@@ -38,7 +38,18 @@ variable "public_subnet_prefix_length" {
 variable "interface_endpoint_services" {
   description = "Interface VPC endpoint service names (the S3 gateway endpoint is always created)."
   type        = list(string)
-  default     = ["ecr.api", "ecr.dkr", "sts", "ec2", "ssm", "ssmmessages", "ec2messages", "eks"]
+  default     = ["ecr.api", "ecr.dkr", "sts", "ec2", "ssm", "ssmmessages", "ec2messages", "eks", "eks-auth"]
+}
+
+variable "endpoint_azs" {
+  description = "AZs that get an interface endpoint ENI (a subset of azs). Empty means every AZ in azs."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for az in var.endpoint_azs : contains(var.azs, az)])
+    error_message = "endpoint_azs must be a subset of azs."
+  }
 }
 
 variable "tags" {

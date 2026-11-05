@@ -1,21 +1,16 @@
 output "cluster_name" {
   description = "Name of the regional router cluster."
-  value       = module.eks.cluster_name
+  value       = module.cluster.cluster_name
 }
 
 output "cluster_endpoint" {
   description = "Private Kubernetes API endpoint."
-  value       = module.eks.cluster_endpoint
+  value       = module.cluster.cluster_endpoint
 }
 
 output "node_security_group_id" {
   description = "Security group of the router cluster nodes and pods."
-  value       = module.eks.node_security_group_id
-}
-
-output "lbc_role_arn" {
-  description = "IRSA role of the AWS Load Balancer Controller."
-  value       = module.lbc_irsa.arn
+  value       = module.cluster.node_security_group_id
 }
 
 output "ecr_repository_urls" {

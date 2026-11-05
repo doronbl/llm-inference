@@ -21,29 +21,21 @@ output "deploy" {
     router = {
       cluster_name     = module.regional.cluster_name
       cluster_endpoint = module.regional.cluster_endpoint
-      lbc_role_arn     = module.regional.lbc_role_arn
       target_group_arn = module.edge.router_target_group_arn
       port             = local.router_port
     }
 
     cells = {
       for id, c in module.cell : id => {
-        cell_id                       = c.cell_id
-        availability_zone             = c.availability_zone
-        cluster_name                  = c.cluster_name
-        cluster_endpoint              = c.cluster_endpoint
-        subnet_id                     = c.subnet_id
-        node_security_group_id        = c.node_security_group_id
-        efa_security_group_id         = c.efa_security_group_id
-        placement_group_name          = c.placement_group_name
-        inference_instance_type       = c.inference_instance_type
-        efa_enabled                   = c.efa_enabled
-        efa_interface_count           = c.efa_interface_count
-        inference_network_interfaces  = c.inference_network_interfaces
-        karpenter_controller_role_arn = c.karpenter_controller_role_arn
-        karpenter_node_role_name      = c.karpenter_node_role_name
-        karpenter_interruption_queue  = c.karpenter_interruption_queue
-        lbc_role_arn                  = c.lbc_role_arn
+        cell_id                      = c.cell_id
+        availability_zone            = c.availability_zone
+        cluster_name                 = c.cluster_name
+        cluster_endpoint             = c.cluster_endpoint
+        subnet_id                    = c.subnet_id
+        inference_instance_type      = c.inference_instance_type
+        efa_interface_count          = c.efa_interface_count
+        karpenter_interruption_queue = c.karpenter_interruption_queue
+        karpenter_manifests          = c.karpenter_manifests
       }
     }
   }

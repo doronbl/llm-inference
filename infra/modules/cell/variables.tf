@@ -34,6 +34,12 @@ variable "efa_enabled" {
   default     = true
 }
 
+variable "inference_cpu_limit" {
+  description = "Upper bound of inference vCPUs per cell (NodePool limit); 960 = 5 x c8i.48xlarge."
+  type        = number
+  default     = 960
+}
+
 ################################################################################
 # Shared settings (identical for every cell in a Region)
 ################################################################################
@@ -49,12 +55,22 @@ variable "kubernetes_version" {
 }
 
 variable "addon_versions" {
-  description = "Pinned EKS add-on versions (keys: vpc-cni, kube-proxy, coredns)."
+  description = "Pinned EKS add-on versions (keys: eks-pod-identity-agent, vpc-cni, kube-proxy, coredns)."
   type        = map(string)
 }
 
 variable "ami_release_version" {
-  description = "Pinned EKS-optimized AL2023 AMI release version for the system node group."
+  description = "Pinned EKS-optimized AL2023 AMI release (for example 1.37.1-20261031), used by the system node group and, as the Karpenter alias al2023@v<date>, by inference nodes."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]{8}$", var.ami_release_version))
+    error_message = "ami_release_version must look like 1.37.1-20261031."
+  }
+}
+
+variable "platform_dir" {
+  description = "Path of the repository's platform/ directory (Karpenter templates, SOCI node config)."
   type        = string
 }
 
@@ -108,7 +124,7 @@ variable "system_node_volume_size_gib" {
 }
 
 variable "node_cloudinit_parts" {
-  description = "cloud-init parts placed before the EKS-generated NodeConfig (SOCI install + NodeConfig fragments)."
+  description = "cloud-init parts placed before the EKS-generated NodeConfig of the system node group."
   type = list(object({
     content      = string
     content_type = optional(string)

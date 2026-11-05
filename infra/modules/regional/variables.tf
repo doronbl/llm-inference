@@ -9,7 +9,7 @@ variable "kubernetes_version" {
 }
 
 variable "addon_versions" {
-  description = "Pinned EKS add-on versions (keys: vpc-cni, kube-proxy, coredns)."
+  description = "Pinned EKS add-on versions (keys: eks-pod-identity-agent, vpc-cni, kube-proxy, coredns)."
   type        = map(string)
 }
 
@@ -68,7 +68,7 @@ variable "system_node_volume_size_gib" {
 }
 
 variable "node_cloudinit_parts" {
-  description = "cloud-init parts placed before the EKS-generated NodeConfig (SOCI install + NodeConfig fragments)."
+  description = "cloud-init parts placed before the EKS-generated NodeConfig of the system node group."
   type = list(object({
     content      = string
     content_type = optional(string)

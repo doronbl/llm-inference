@@ -1,23 +1,19 @@
 # One cell = one EKS cluster in one Availability Zone.
 #
-#   - System managed node group (in the cell AZ) for add-ons, Karpenter, the AWS
-#     Load Balancer Controller and the Dynamo platform/frontend.
-#   - Karpenter IAM/SQS resources (IRSA) for the AZ-pinned inference NodePool.
-#     The NodePool/EC2NodeClass objects themselves are Kubernetes resources
-#     applied from platform/karpenter/ with the values this module outputs.
-#   - Cluster placement group and EFA security group for inference nodes.
-#   - IRSA role for the AWS Load Balancer Controller (internal NLB in front of
-#     the Dynamo frontend).
+#   - EKS cluster + system managed node group in the cell AZ (eks-base)
+#   - Karpenter IAM, SQS interruption queue and Pod Identity association
+#   - Cluster placement group and EFA security group for inference nodes
+#   - Pod Identity role for the AWS Load Balancer Controller (internal NLB)
+#   - The inference EC2NodeClass and NodePool, rendered from
+#     platform/karpenter/*.tftpl and output as one manifest for kubectl
 
-data "aws_partition" "current" {}
+data "aws_region" "current" {}
 
 data "aws_ec2_instance_type" "inference" {
-  region        = var.region
   instance_type = var.inference_instance_type
 }
 
 data "aws_ec2_instance_type_offerings" "inference_in_az" {
-  region        = var.region
   location_type = "availability-zone"
 
   filter {
@@ -47,177 +43,57 @@ locals {
     local.efa_interface_count >= 1 ? [{ networkCardIndex = 0, deviceIndex = 1, interfaceType = "efa-only" }] : [],
     [for card in range(1, local.efa_interface_count) : { networkCardIndex = card, deviceIndex = 0, interfaceType = "efa-only" }],
   ) : []
+
+  # Same AMI release as the system node groups: "1.37.1-20261031" -> "al2023@v20261031".
+  ami_alias = "al2023@v${split("-", var.ami_release_version)[1]}"
 }
 
 ################################################################################
 # EKS cluster + system node group
 ################################################################################
 
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "21.29.0"
+module "cluster" {
+  source = "../eks-base"
 
-  region             = var.region
-  name               = local.cluster_name
-  kubernetes_version = var.kubernetes_version
-
-  endpoint_public_access  = false
-  endpoint_private_access = true
+  cluster_name        = local.cluster_name
+  kubernetes_version  = var.kubernetes_version
+  addon_versions      = var.addon_versions
+  ami_release_version = var.ami_release_version
 
   vpc_id = var.vpc_id
   # Nodes live only in the cell AZ; the control plane needs at least two AZs.
-  subnet_ids               = [var.cell_subnet_id]
+  node_subnet_ids          = [var.cell_subnet_id]
   control_plane_subnet_ids = var.control_plane_subnet_ids
+  vpc_cidr                 = var.vpc_cidr
 
-  authentication_mode                      = "API"
-  enable_cluster_creator_admin_permissions = true
-  access_entries = {
-    for i, arn in var.admin_principal_arns : "admin-${i}" => {
-      principal_arn = arn
-      policy_associations = {
-        admin = {
-          policy_arn   = "arn:${data.aws_partition.current.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-          access_scope = { type = "cluster" }
-        }
-      }
-    }
-  }
+  system_instance_types         = var.system_instance_types
+  system_node_min_size          = var.system_node_min_size
+  system_node_desired_size      = var.system_node_desired_size
+  system_node_max_size          = var.system_node_max_size
+  system_node_volume_size_gib   = var.system_node_volume_size_gib
+  system_node_volume_throughput = 500
+  node_cloudinit_parts          = var.node_cloudinit_parts
 
-  enable_irsa = true
-
-  addons = {
-    vpc-cni = {
-      addon_version  = var.addon_versions["vpc-cni"]
-      most_recent    = false
-      before_compute = true
-      configuration_values = jsonencode({
-        env = {
-          ENABLE_PREFIX_DELEGATION = "true"
-          WARM_PREFIX_TARGET       = "1"
-        }
-      })
-    }
-    kube-proxy = {
-      addon_version  = var.addon_versions["kube-proxy"]
-      most_recent    = false
-      before_compute = true
-    }
-    coredns = {
-      addon_version = var.addon_versions["coredns"]
-      most_recent   = false
-    }
-  }
-
-  security_group_additional_rules = {
-    ingress_vpc_https = {
-      description = "Kubernetes API from inside the VPC (operator SSM tunnel)"
-      protocol    = "tcp"
-      from_port   = 443
-      to_port     = 443
-      type        = "ingress"
-      cidr_blocks = [var.vpc_cidr]
-    }
-  }
-
-  node_security_group_additional_rules = {
-    ingress_self_all = {
-      description = "Node to node, all ports (Dynamo request/event planes, NATS)"
-      protocol    = "-1"
-      from_port   = 0
-      to_port     = 0
-      type        = "ingress"
-      self        = true
-    }
-  }
-
-  # Karpenter discovers nothing by tag; the EC2NodeClass selects subnet and
-  # security groups by ID. The tag is kept for operators and tooling.
   node_security_group_tags = {
     "karpenter.sh/discovery" = local.cluster_name
   }
 
-  eks_managed_node_groups = {
-    system = {
-      ami_type            = "AL2023_x86_64_STANDARD"
-      ami_release_version = var.ami_release_version
-      instance_types      = var.system_instance_types
-      capacity_type       = "ON_DEMAND"
-
-      min_size     = var.system_node_min_size
-      max_size     = var.system_node_max_size
-      desired_size = var.system_node_desired_size
-
-      subnet_ids = [var.cell_subnet_id]
-
-      labels = {
-        "llm-inference/node-class" = "system"
-      }
-
-      cloudinit_pre_nodeadm = var.node_cloudinit_parts
-
-      block_device_mappings = {
-        xvda = {
-          device_name = "/dev/xvda"
-          ebs = {
-            volume_size           = var.system_node_volume_size_gib
-            volume_type           = "gp3"
-            throughput            = 500
-            encrypted             = true
-            delete_on_termination = true
-          }
-        }
-      }
-
-      iam_role_additional_policies = {
-        ssm = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
-      }
-    }
-  }
-
-  tags = var.tags
+  admin_principal_arns = var.admin_principal_arns
+  tags                 = var.tags
 }
 
 ################################################################################
-# Karpenter (IRSA)
+# Karpenter (module defaults: Pod Identity association for kube-system/karpenter)
 ################################################################################
-
-# Replaces the Pod Identity trust statement of the Karpenter submodule (same
-# Sid) with an IRSA web-identity trust for kube-system:karpenter.
-data "aws_iam_policy_document" "karpenter_irsa_trust" {
-  statement {
-    sid     = "PodIdentity"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [module.eks.oidc_provider_arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "${module.eks.oidc_provider}:sub"
-      values   = ["system:serviceaccount:kube-system:karpenter"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "${module.eks.oidc_provider}:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-  }
-}
 
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
   version = "21.29.0"
 
-  region       = var.region
-  cluster_name = module.eks.cluster_name
+  cluster_name = module.cluster.cluster_name
 
-  create_pod_identity_association           = false
-  iam_role_name                             = "${local.cluster_name}-karpenter"
-  iam_role_use_name_prefix                  = false
-  iam_role_override_assume_policy_documents = [data.aws_iam_policy_document.karpenter_irsa_trust.json]
+  iam_role_name            = "${local.cluster_name}-karpenter"
+  iam_role_use_name_prefix = false
 
   node_iam_role_name            = "${local.cluster_name}-karpenter-node"
   node_iam_role_use_name_prefix = false
@@ -230,12 +106,13 @@ module "karpenter" {
   tags = var.tags
 }
 
+data "aws_partition" "current" {}
+
 ################################################################################
 # Inference node placement and EFA security group
 ################################################################################
 
 resource "aws_placement_group" "inference" {
-  region   = var.region
   name     = "${local.cluster_name}-inference"
   strategy = "cluster"
   tags     = var.tags
@@ -243,7 +120,6 @@ resource "aws_placement_group" "inference" {
 
 # EFA requires a security group that allows all traffic to and from itself.
 resource "aws_security_group" "efa" {
-  region      = var.region
   name_prefix = "${local.cluster_name}-efa-"
   description = "EFA: all traffic to and from itself"
   vpc_id      = var.vpc_id
@@ -251,6 +127,11 @@ resource "aws_security_group" "efa" {
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      condition     = var.region == data.aws_region.current.region
+      error_message = "Cell region ${var.region} does not match the provider region ${data.aws_region.current.region}."
+    }
 
     precondition {
       condition     = !var.efa_enabled || data.aws_ec2_instance_type.inference.efa_supported
@@ -265,7 +146,6 @@ resource "aws_security_group" "efa" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "efa_self" {
-  region                       = var.region
   security_group_id            = aws_security_group.efa.id
   description                  = "All traffic from itself"
   ip_protocol                  = "-1"
@@ -273,7 +153,6 @@ resource "aws_vpc_security_group_ingress_rule" "efa_self" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "efa_self" {
-  region                       = var.region
   security_group_id            = aws_security_group.efa.id
   description                  = "All traffic to itself"
   ip_protocol                  = "-1"
@@ -281,24 +160,68 @@ resource "aws_vpc_security_group_egress_rule" "efa_self" {
 }
 
 ################################################################################
-# IRSA: AWS Load Balancer Controller
+# Pod Identity: AWS Load Balancer Controller
 ################################################################################
 
-module "lbc_irsa" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
-  version = "6.8.2"
+module "lbc_pod_identity" {
+  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "2.10.0"
 
   name            = "${local.cluster_name}-lbc"
   use_name_prefix = false
 
-  attach_load_balancer_controller_policy = true
+  attach_aws_lb_controller_policy = true
 
-  oidc_providers = {
+  associations = {
     this = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["kube-system:aws-load-balancer-controller"]
+      cluster_name    = module.cluster.cluster_name
+      namespace       = "kube-system"
+      service_account = "aws-load-balancer-controller"
     }
   }
 
   tags = var.tags
+}
+
+################################################################################
+# Karpenter inference EC2NodeClass + NodePool (applied by scripts/41-*)
+################################################################################
+
+# SOCI on inference nodes only: the AMI's built-in snapshotter, enabled through
+# nodeadm, plus the switch from parallel pull to lazy loading.
+data "cloudinit_config" "inference" {
+  gzip          = false
+  base64_encode = false
+  boundary      = "//"
+
+  part {
+    content_type = "application/node.eks.aws"
+    content      = file("${var.platform_dir}/soci/nodeconfig.yaml")
+  }
+
+  part {
+    content_type = "text/x-shellscript; charset=\"us-ascii\""
+    content      = file("${var.platform_dir}/soci/lazy-loading.sh")
+  }
+}
+
+locals {
+  karpenter_manifests = join("\n---\n", [
+    templatefile("${var.platform_dir}/karpenter/ec2nodeclass.yaml.tftpl", {
+      node_role            = module.karpenter.node_iam_role_name
+      ami_alias            = local.ami_alias
+      subnet_id            = var.cell_subnet_id
+      security_group_ids   = [module.cluster.node_security_group_id, aws_security_group.efa.id]
+      placement_group_name = aws_placement_group.inference.name
+      network_interfaces   = local.inference_network_interfaces
+      cell_id              = var.cell_id
+      user_data            = data.cloudinit_config.inference.rendered
+    }),
+    templatefile("${var.platform_dir}/karpenter/nodepool.yaml.tftpl", {
+      cell_id           = var.cell_id
+      availability_zone = var.availability_zone
+      instance_type     = var.inference_instance_type
+      cpu_limit         = var.inference_cpu_limit
+    }),
+  ])
 }

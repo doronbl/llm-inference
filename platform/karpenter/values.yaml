@@ -2,8 +2,8 @@
 # scripts/versions.env). Installed on every cell cluster, in kube-system.
 #
 # Set per cell at install time (scripts/41-platform-cells.sh):
-#   settings.clusterName, settings.clusterEndpoint, settings.interruptionQueue,
-#   serviceAccount.annotations."eks.amazonaws.com/role-arn" (IRSA, from Terraform)
+#   settings.clusterName, settings.clusterEndpoint, settings.interruptionQueue
+# IAM: EKS Pod Identity association for kube-system/karpenter (Terraform).
 
 replicas: 2
 

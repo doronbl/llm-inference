@@ -1,85 +1,30 @@
 # Regional router cluster: one EKS cluster per Region (private API endpoint),
-# a small system managed node group that runs the router pods and add-ons,
-# the ECR repositories the platform owns, and the IRSA role of the AWS Load
+# a small system node group that runs the router pods and add-ons, the ECR
+# repositories the platform owns, and the Pod Identity role of the AWS Load
 # Balancer Controller (which binds router pods to the ALB target group).
 
-data "aws_partition" "current" {}
+module "cluster" {
+  source = "../eks-base"
 
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "21.29.0"
-
-  name               = var.cluster_name
-  kubernetes_version = var.kubernetes_version
-
-  # Private API endpoint only; operators come in through an SSM tunnel.
-  endpoint_public_access  = false
-  endpoint_private_access = true
+  cluster_name        = var.cluster_name
+  kubernetes_version  = var.kubernetes_version
+  addon_versions      = var.addon_versions
+  ami_release_version = var.ami_release_version
 
   vpc_id                   = var.vpc_id
-  subnet_ids               = var.node_subnet_ids
+  vpc_cidr                 = var.vpc_cidr
+  node_subnet_ids          = var.node_subnet_ids
   control_plane_subnet_ids = var.control_plane_subnet_ids
 
-  authentication_mode                      = "API"
-  enable_cluster_creator_admin_permissions = true
-  access_entries = {
-    for i, arn in var.admin_principal_arns : "admin-${i}" => {
-      principal_arn = arn
-      policy_associations = {
-        admin = {
-          policy_arn   = "arn:${data.aws_partition.current.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
-          access_scope = { type = "cluster" }
-        }
-      }
-    }
-  }
-
-  enable_irsa = true
-
-  addons = {
-    vpc-cni = {
-      addon_version  = var.addon_versions["vpc-cni"]
-      most_recent    = false
-      before_compute = true
-      configuration_values = jsonencode({
-        env = {
-          ENABLE_PREFIX_DELEGATION = "true"
-          WARM_PREFIX_TARGET       = "1"
-        }
-      })
-    }
-    kube-proxy = {
-      addon_version  = var.addon_versions["kube-proxy"]
-      most_recent    = false
-      before_compute = true
-    }
-    coredns = {
-      addon_version = var.addon_versions["coredns"]
-      most_recent   = false
-    }
-  }
-
-  # The operator instance lives inside the VPC and reaches the private endpoint.
-  security_group_additional_rules = {
-    ingress_vpc_https = {
-      description = "Kubernetes API from inside the VPC (operator SSM tunnel)"
-      protocol    = "tcp"
-      from_port   = 443
-      to_port     = 443
-      type        = "ingress"
-      cidr_blocks = [var.vpc_cidr]
-    }
-  }
+  system_instance_types         = var.system_instance_types
+  system_node_min_size          = var.system_node_min_size
+  system_node_desired_size      = var.system_node_desired_size
+  system_node_max_size          = var.system_node_max_size
+  system_node_volume_size_gib   = var.system_node_volume_size_gib
+  system_node_volume_throughput = 250
+  node_cloudinit_parts          = var.node_cloudinit_parts
 
   node_security_group_additional_rules = {
-    ingress_self_all = {
-      description = "Node to node, all ports"
-      protocol    = "-1"
-      from_port   = 0
-      to_port     = 0
-      type        = "ingress"
-      self        = true
-    }
     ingress_alb_router = {
       description              = "Public ALB to router pods (IP targets)"
       protocol                 = "tcp"
@@ -90,46 +35,8 @@ module "eks" {
     }
   }
 
-  eks_managed_node_groups = {
-    system = {
-      ami_type            = "AL2023_x86_64_STANDARD"
-      ami_release_version = var.ami_release_version
-      instance_types      = var.system_instance_types
-      capacity_type       = "ON_DEMAND"
-
-      min_size     = var.system_node_min_size
-      max_size     = var.system_node_max_size
-      desired_size = var.system_node_desired_size
-
-      subnet_ids = var.node_subnet_ids
-
-      labels = {
-        "llm-inference/node-class" = "system"
-      }
-
-      # SOCI snapshotter + kubelet settings, merged with the EKS-generated NodeConfig.
-      cloudinit_pre_nodeadm = var.node_cloudinit_parts
-
-      block_device_mappings = {
-        xvda = {
-          device_name = "/dev/xvda"
-          ebs = {
-            volume_size           = var.system_node_volume_size_gib
-            volume_type           = "gp3"
-            throughput            = 250
-            encrypted             = true
-            delete_on_termination = true
-          }
-        }
-      }
-
-      iam_role_additional_policies = {
-        ssm = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
-      }
-    }
-  }
-
-  tags = var.tags
+  admin_principal_arns = var.admin_principal_arns
+  tags                 = var.tags
 }
 
 ################################################################################
@@ -173,22 +80,23 @@ resource "aws_ecr_lifecycle_policy" "this" {
 }
 
 ################################################################################
-# IRSA: AWS Load Balancer Controller
+# Pod Identity: AWS Load Balancer Controller
 ################################################################################
 
-module "lbc_irsa" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
-  version = "6.8.2"
+module "lbc_pod_identity" {
+  source  = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "2.10.0"
 
   name            = "${var.cluster_name}-lbc"
   use_name_prefix = false
 
-  attach_load_balancer_controller_policy = true
+  attach_aws_lb_controller_policy = true
 
-  oidc_providers = {
+  associations = {
     this = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["kube-system:aws-load-balancer-controller"]
+      cluster_name    = module.cluster.cluster_name
+      namespace       = "kube-system"
+      service_account = "aws-load-balancer-controller"
     }
   }
 
