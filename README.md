@@ -109,6 +109,7 @@ For example, after step 1 (the role `llm-operator-tunnel` and its instance profi
 
 ```bash
 TF="terraform -chdir=infra/envs/region"
+export AWS_DEFAULT_REGION=$($TF output -json deploy | jq -r .region)
 VPC=$($TF output -json deploy | jq -r .vpc_id)
 SUBNET=$($TF output -json deploy | jq -r '.cells | to_entries[0].value.subnet_id')
 SG=$(aws ec2 create-security-group --group-name llm-operator-tunnel --vpc-id $VPC \
