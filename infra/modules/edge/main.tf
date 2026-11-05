@@ -136,6 +136,19 @@ resource "aws_vpc_security_group_ingress_rule" "alb_https" {
   cidr_ipv4         = "0.0.0.0/0"
 }
 
+# The jwt-validation action fetches the signing keys from the public Cognito
+# JWKS endpoint through the ALB's own network interfaces. Without this rule
+# every request fails with 500 at the ALB. Cognito has no fixed IP ranges or
+# managed prefix list, so the destination is any address on 443.
+resource "aws_vpc_security_group_egress_rule" "alb_jwks" {
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS to the Cognito JWKS endpoint (JWT validation)"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
 resource "aws_vpc_security_group_egress_rule" "alb_to_router" {
   security_group_id = aws_security_group.alb.id
   description       = "To router pods (IP targets)"

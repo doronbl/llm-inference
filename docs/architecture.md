@@ -119,6 +119,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
   - Public ALB, its listener, ACM certificate, JWT verification rule, and target group are created by **Terraform**. Router pods are registered into the target group by the **AWS Load Balancer Controller** via `TargetGroupBinding` (IP targets).
   - Internal NLB per cell is created by the **AWS Load Balancer Controller** from a Kubernetes `Service` of type `LoadBalancer` (internal, IP targets) in front of the Dynamo frontend. It is a separate Service because the Service the Dynamo operator creates for the frontend is always ClusterIP.
   - ALB idle timeout 3600 s to support long SSE streams.
+  - ALB security group: inbound 443 from the internet; outbound to the router port in the VPC, and outbound 443 to the internet, because the JWT verification fetches the Cognito JWKS through the ALB's own network interfaces.
 
 ---
 
