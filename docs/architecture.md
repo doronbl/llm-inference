@@ -155,7 +155,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 | Pod networking | Amazon VPC CNI with prefix delegation |
 | Model storage | Amazon S3 (source of truth) — used from Phase 2 |
 | Model loading | Run:ai Model Streamer (from S3) — used from Phase 2 |
-| Container image loading | SOCI snapshotter on Karpenter inference nodes only (enabled in Phase 1): the AL2023 AMI's built-in snapshotter, enabled with the nodeadm `FastImagePull` feature gate and switched from parallel pull to lazy loading. A SOCI index is built on the operator host with the `soci` CLI only for the `dynamo-planner` mirror |
+| Container image loading | SOCI snapshotter on Karpenter inference nodes only (enabled in Phase 1): the AL2023 AMI's built-in snapshotter, enabled with the nodeadm `FastImagePull` feature gate and switched from parallel pull to lazy loading, using the snapshotter's own (SOCI) content store. A SOCI index is built on the operator host with the `soci` CLI only for the `dynamo-planner` mirror |
 | Container registry | Amazon ECR: `router` repo (plain image) and a `dynamo-planner` mirror repo (with SOCI index) |
 | Infrastructure as code | Terraform, local state |
 | Logs and metrics | Amazon CloudWatch (default EKS/EC2/ALB/NLB integration only) |

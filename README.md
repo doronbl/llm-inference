@@ -164,7 +164,12 @@ sleep 5; aws ssm get-command-invocation --command-id $CMD --instance-id $INSTANC
 
 The output lists `fuse.rawBridge` mounts under `/var/lib/soci-snapshotter-grpc/`, one for each lazily loaded layer of `…/dynamo-planner:1.6.1-soci`.
 
-SOCI runs only on inference nodes. They use the snapshotter that ships in the AL2023 AMI, enabled by the nodeadm `FastImagePull` feature gate (`platform/soci/nodeconfig.yaml`). That gate configures SOCI for parallel pull, which never lazy-loads, so `platform/soci/lazy-loading.sh` turns parallel pull off at boot. If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
+SOCI runs only on inference nodes. They use the snapshotter that ships in the AL2023 AMI, enabled by the nodeadm `FastImagePull` feature gate (`platform/soci/nodeconfig.yaml`). `platform/soci/lazy-loading.sh` changes two settings of that configuration at boot:
+
+- It turns parallel pull off. In that mode SOCI never lazy-loads.
+- It switches the snapshotter from the containerd content store to its own (`content_store.type = 'soci'`). With the containerd content store, a lazy mount that runs while containerd unpacks another image can deadlock both daemons on the node's first boot. Every later pull then hangs and pods stay in `ContainerCreating` ([awslabs/soci-snapshotter#2037](https://github.com/awslabs/soci-snapshotter/issues/2037), still open for the v0.16.1 snapshotter in the AMI).
+
+If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
 
 ### 4. Streaming returns OpenAI SSE chunks ending with `data: [DONE]`
 
