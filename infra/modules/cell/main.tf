@@ -95,6 +95,10 @@ module "karpenter" {
   iam_role_name            = "${local.cluster_name}-karpenter"
   iam_role_use_name_prefix = false
 
+  # The controller policy is larger than the 6,144-character limit of a managed
+  # IAM policy; an inline role policy allows 10,240 characters.
+  enable_inline_policy = true
+
   node_iam_role_name            = "${local.cluster_name}-karpenter-node"
   node_iam_role_use_name_prefix = false
   node_iam_role_additional_policies = {
@@ -171,6 +175,8 @@ module "lbc_pod_identity" {
   use_name_prefix = false
 
   attach_aws_lb_controller_policy = true
+  # IAM policy names are account-wide: one policy per cluster.
+  aws_lb_controller_policy_name = "${local.cluster_name}-lbc"
 
   associations = {
     this = {
