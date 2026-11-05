@@ -1,0 +1,26 @@
+# Karpenter (chart oci://public.ecr.aws/karpenter/karpenter, version pinned in
+# scripts/versions.env). Installed on every cell cluster, in kube-system.
+#
+# Set per cell at install time (scripts/41-platform-cells.sh):
+#   settings.clusterName, settings.clusterEndpoint, settings.interruptionQueue
+# IAM: EKS Pod Identity association for kube-system/karpenter (Terraform).
+
+replicas: 2
+
+serviceAccount:
+  create: true
+  name: karpenter
+
+# Karpenter runs on the system managed node group, never on nodes it manages.
+nodeSelector:
+  llm-inference/node-class: system
+
+controller:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+logLevel: info

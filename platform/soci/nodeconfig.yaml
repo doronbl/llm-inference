@@ -1,0 +1,11 @@
+---
+# Enables the SOCI snapshotter that ships in the EKS-optimized AL2023 AMI.
+# With this feature gate, nodeadm configures containerd (soci proxy
+# snapshotter), the kubelet image service endpoint, the CRI credential
+# keychain and the pause image import. Used on the Karpenter inference
+# EC2NodeClass only (rendered by infra/modules/cell).
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  featureGates:
+    FastImagePull: true

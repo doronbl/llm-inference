@@ -1,0 +1,46 @@
+# Inference EC2NodeClass, one per cell. Rendered with templatefile() by
+# infra/modules/cell and applied by scripts/41-platform-cells.sh.
+#   - EKS-optimized AL2023 AMI: same release as the system node groups
+#   - the cell's single private subnet (AZ-pinned)
+#   - node security group + self-referencing EFA security group
+#   - cluster placement group of the cell
+#   - EFA-only secondary interfaces (omitted when efa_enabled = false)
+#   - SOCI lazy loading (platform/soci/) through MIME user data, merged by
+#     nodeadm with the NodeConfig Karpenter generates
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: inference
+spec:
+  role: ${node_role}
+  amiSelectorTerms:
+    - alias: ${ami_alias}
+  subnetSelectorTerms:
+    - id: ${subnet_id}
+  securityGroupSelectorTerms:
+%{ for sg in security_group_ids ~}
+    - id: ${sg}
+%{ endfor ~}
+  placementGroupSelector:
+    name: ${placement_group_name}
+%{ if length(network_interfaces) > 0 ~}
+  networkInterfaces: ${jsonencode(network_interfaces)}
+%{ endif ~}
+  kubelet:
+    maxPods: 110
+  metadataOptions:
+    httpEndpoint: enabled
+    httpTokens: required
+    httpPutResponseHopLimit: 1
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 300Gi
+        volumeType: gp3
+        iops: 16000
+        throughput: 1000
+        encrypted: true
+        deleteOnTermination: true
+  tags:
+    llm-inference/cell: "${cell_id}"
+  userData: ${jsonencode(user_data)}

@@ -1,0 +1,27 @@
+# NVIDIA Dynamo platform (chart dynamo-platform from helm.ngc.nvidia.com,
+# version pinned in scripts/versions.env). Installed on every cell cluster in
+# the dynamo-system namespace.
+#
+# Only the Dynamo operator is installed. Workers are discovered through the
+# Kubernetes API, requests use the TCP request plane and KV events the ZMQ
+# event plane (all Dynamo 1.6.1 defaults), so neither etcd nor NATS is
+# deployed. The frontend/KV Router and workers are created by the operator
+# from the DynamoGraphDeployment in workloads/stub-engine/.
+
+global:
+  etcd:
+    install: false
+  nats:
+    install: false
+
+dynamo-operator:
+  discoveryBackend: kubernetes
+  controllerManager:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: llm-inference/node-class
+                  operator: In
+                  values: ["system"]

@@ -1,0 +1,30 @@
+[project]
+name = "llm-router"
+version = "0.1.0"
+description = "Regional router: Cognito JWT check and session-to-cell pinning in front of Dynamo cells"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.162.0",
+  "uvicorn==0.54.0",
+  "httpx==0.28.1",
+  "pyjwt[crypto]==2.15.1",
+  "cryptography==50.0.2",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.2.0",
+]
+
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-q"
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]

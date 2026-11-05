@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars (git-ignored) and replace every placeholder.
+
+region           = "<aws-region>"           # for example us-east-1
+hosted_zone_name = "<existing-public-zone>" # for example example.com
+api_hostname     = "<api-hostname>"         # for example api.example.com
+
+vpc_cidr = "10.0.0.0/16"
+
+# Two cells, each pinned to a different Availability Zone of the Region.
+cells = {
+  a = {
+    availability_zone       = "<region>a"
+    inference_instance_type = "c8i.48xlarge"
+    efa_enabled             = true
+  }
+  b = {
+    availability_zone       = "<region>b"
+    inference_instance_type = "c8i.48xlarge"
+    efa_enabled             = true
+  }
+}
+
+regional_system_instance_types = ["c8i.xlarge"]
+cell_system_instance_types     = ["c8i.2xlarge"]
+
+# Extra IAM role ARN(s) that get cluster-admin for kubectl/Helm through the SSM
+# tunnel. The identity that runs terraform apply is granted cluster-admin
+# automatically: do not list it here again (EKS rejects duplicate access
+# entries). Use [] if the same identity runs Terraform and kubectl.
+operator_principal_arns = [
+  "arn:aws:iam::<account-id>:role/<operator-role>",
+]
