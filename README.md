@@ -101,7 +101,7 @@ Run the steps from the repository root. Each step can be re-run.
 | 2 | `OPERATOR_INSTANCE_ID=i-… scripts/20-tunnels.sh start` | Opens SSM tunnels and writes `.state/region/kubeconfig` with one context per cluster |
 | 3 | `scripts/30-images.sh` | Builds and pushes the router image with Docker (git-SHA tag). Mirrors `dynamo-planner:1.6.1` from NGC, converts it to a SOCI-enabled image (index manifest v2) and pushes it to ECR |
 | 4 | `scripts/40-platform-router.sh` | AWS Load Balancer Controller on the router cluster |
-| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter, `kubectl apply` of the EC2NodeClass and NodePool that Terraform rendered, EFA device plugin, Dynamo platform (operator + NATS) |
+| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter, `kubectl apply` of the EC2NodeClass and NodePool that Terraform rendered, EFA device plugin, Dynamo platform (operator only) |
 | 6 | `scripts/50-stub-engine.sh` | Per cell: the `DynamoGraphDeployment` (frontend + KV Router + mocker) and the internal NLB. Karpenter launches the inference node (about 10 min) |
 | 7 | `scripts/60-router.sh` | Router ConfigMaps (cell list = internal NLB URLs), Deployment and TargetGroupBinding. Waits for healthy ALB targets |
 | 8 | `scripts/70-verify.sh` | Runs every DoD check below |
@@ -288,5 +288,5 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 - **IAM:** in-cluster controllers (Karpenter, Load Balancer Controller) get credentials through EKS Pod Identity associations created by Terraform. The clusters have no OIDC provider.
 - **Downloads at startup:** nodes download nothing at boot. The mocker downloads its tokenizer (`Qwen/Qwen3-0.6B`) from Hugging Face at startup.
 - **Dynamo frontends:** each cell runs two frontend replicas. Each one subscribes to the workers' KV events itself (event plane, ZMQ by default), so both build the same prefix index. `DYN_ROUTER_REPLICA_SYNC=true` also shares active-request load between them.
-- **NATS:** NATS runs JetStream in memory, so the cells need no persistent volumes.
+- **No NATS or etcd:** Dynamo 1.6.1 discovers workers through the Kubernetes API, sends requests over TCP and KV events over ZMQ, so the platform chart installs only the operator. NATS would only be needed for `DYN_EVENT_PLANE=nats`, `DYN_REQUEST_PLANE=nats` or a NATS request-trace sink.
 - **EFA device plugin image:** the plugin image comes from the EKS add-on registry of the Region, account `602401143452`. Opt-in Regions use a different account; set `EKS_ADDON_REGISTRY_ACCOUNT` in `scripts/versions.env`.

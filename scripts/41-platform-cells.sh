@@ -2,7 +2,7 @@
 # Step 5: add-ons on every cell cluster:
 #   AWS Load Balancer Controller, Karpenter (+ the inference EC2NodeClass and
 #   NodePool rendered by Terraform), EFA device plugin, Dynamo platform
-#   (operator + NATS). IAM comes from EKS Pod Identity associations created by
+#   (operator only). IAM comes from EKS Pod Identity associations created by
 #   Terraform, so no service-account annotations are set here.
 # Requires the tunnels from scripts/20-tunnels.sh.
 source "$(dirname "$0")/lib.sh"
