@@ -1,0 +1,36 @@
+# AWS Load Balancer Controller (chart eks/aws-load-balancer-controller, version
+# pinned in scripts/versions.env). Installed on the regional router cluster and
+# on every cell cluster.
+#
+# Set per cluster at install time (scripts/40-*, scripts/41-*):
+#   clusterName, region, vpcId,
+#   serviceAccount.annotations."eks.amazonaws.com/role-arn" (IRSA, from Terraform)
+#
+# Router cluster: registers router pod IPs into the Terraform-owned ALB target
+# group through a TargetGroupBinding.
+# Cell clusters: creates the internal NLB from the Dynamo frontend Service.
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+
+nodeSelector:
+  llm-inference/node-class: system
+
+# Only Services that explicitly request this controller (loadBalancerClass:
+# service.k8s.aws/nlb) get a load balancer.
+enableServiceMutatorWebhook: false
+
+defaultTargetType: ip
+
+# No Ingress objects are used; the ALB is owned by Terraform.
+createIngressClassResource: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

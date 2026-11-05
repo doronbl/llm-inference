@@ -1,0 +1,50 @@
+# NVIDIA Dynamo platform (chart dynamo-platform from helm.ngc.nvidia.com,
+# version pinned in scripts/versions.env). Installed on every cell cluster in
+# the dynamo-system namespace.
+#
+# Components: Dynamo operator + NATS. Workers are discovered through the
+# Kubernetes API (no etcd). Everything runs on the system node group; the
+# Dynamo frontend/KV Router and workers are created by the operator from the
+# DynamoGraphDeployment in workloads/stub-engine/.
+
+global:
+  etcd:
+    install: false
+  nats:
+    install: true
+
+dynamo-operator:
+  discoveryBackend: kubernetes
+  controllerManager:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: llm-inference/node-class
+                  operator: In
+                  values: ["system"]
+
+nats:
+  config:
+    jetstream:
+      enabled: true
+      # In-memory JetStream: no PersistentVolume (and no CSI driver) needed.
+      fileStore:
+        enabled: false
+      memoryStore:
+        enabled: true
+        maxSize: 1Gi
+  container:
+    merge:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 512Mi
+        limits:
+          memory: 2Gi
+  podTemplate:
+    merge:
+      spec:
+        nodeSelector:
+          llm-inference/node-class: system

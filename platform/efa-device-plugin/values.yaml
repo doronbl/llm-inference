@@ -1,0 +1,17 @@
+# EFA Kubernetes device plugin (chart eks/aws-efa-k8s-device-plugin, version
+# pinned in scripts/versions.env). Installed on every cell cluster.
+#
+# Advertises EFA devices as the vpc.amazonaws.com/efa node resource. The
+# chart's default node affinity limits it to EFA-capable instance types
+# (c8i.48xlarge and the P5 family are in the list).
+#
+# Set at install time: image.repository (the EKS add-on registry of the Region).
+
+tolerations:
+  - key: llm-inference/inference
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+nodeSelector:
+  llm-inference/node-class: inference
