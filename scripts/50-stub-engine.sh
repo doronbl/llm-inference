@@ -25,7 +25,8 @@ done
 for id in $(cell_ids); do
   CTX="$(cell_cluster "${id}")"
   log "Waiting for cell ${id}"
-  kc "${CTX}" -n llm-inference wait --for=condition=Ready dynamographdeployment/stub-engine --timeout=45m
+  kc "${CTX}" -n llm-inference wait --for=condition=Ready dynamographdeployment/stub-engine \
+    --timeout="${STUB_ENGINE_TIMEOUT:-45m}"
   ok "stub-engine Ready"
 
   hostname=""

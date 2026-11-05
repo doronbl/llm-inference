@@ -41,37 +41,95 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
 - A **public Route 53 hosted zone** for the domain that holds the API hostname (for example zone `example.com`, hostname `api.example.com`).
 - **On-demand vCPU quota** for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" of at least about **450 vCPUs** in the Region. Each inference node is a `c8i.48xlarge` with 192 vCPUs, one per cell. The system nodes add about 40 vCPUs.
 - `c8i.48xlarge` offered in both cell AZs. Terraform checks this and fails the plan if it is not.
+- **On-demand capacity** for the inference instance type in both cell AZs. Being offered is not the same as having capacity: when an AZ has none, Karpenter's launches fail with `InsufficientInstanceCapacity` and the mocker pods stay `Pending`. Check capacity before you choose the cell AZs. `c7i.48xlarge` has the same vCPU count and EFA layout (one EFA-only interface) and can replace `c8i.48xlarge` without code changes. AZ names map to different AZ IDs in each account; `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` shows the mapping.
 - Permissions to create VPC, EKS, EC2, ELB, IAM, Cognito, ACM, Route 53, ECR, SQS, EventBridge and SSM resources.
 
 > **Cost:** each `c8i.48xlarge` costs about $8–9 per hour on demand, so two cells cost about $17 per hour while inference nodes run. On top of that you pay for three EKS control planes, NAT gateways, the load balancers and the system nodes. Run `scripts/90-teardown.sh` when you are done.
 
 ### Operator host
 
-The operator host is the machine where you run Terraform and the scripts. It must be Linux on x86_64, because the SOCI conversion of the `dynamo-planner` image needs containerd. It needs these tools:
+The operator host is the machine where you run Terraform and the scripts. It must be Linux on x86_64, because the SOCI conversion of the `dynamo-planner` image needs containerd. Its AWS identity needs the permissions listed above. It needs these tools:
 
-| Tool | Version used |
-|---|---|
-| Terraform | 1.17.x |
-| AWS CLI v2 + Session Manager plugin | current |
-| kubectl | 1.36 or later (clusters run Kubernetes 1.37) |
-| Helm | 3.x (3.19 tested) |
-| Docker (with buildx) | current, to build the router image |
-| containerd 2.x + nerdctl | to pull, convert and push the `dynamo-planner` mirror (run with `sudo`) |
-| `soci` CLI | 0.16.1 (from the [soci-snapshotter release](https://github.com/awslabs/soci-snapshotter/releases/tag/v0.16.1)) |
-| jq, curl, git, envsubst (gettext), setsid (util-linux) | any |
-| Python 3.11+ with `openai==3.46.0` | for DoD 7 |
+| Tool | Required | Tested |
+|---|---|---|
+| Terraform | 1.17.x | 1.17.1 |
+| AWS CLI v2 + Session Manager plugin | current | 2.x + plugin 1.2.896.0 |
+| kubectl | 1.36 or later (clusters run Kubernetes 1.37) | 1.37.2 |
+| Helm | 3.x | 3.19.5 |
+| Docker (with buildx) | current, to build the router image | 28.2.2, buildx 0.24.0 |
+| containerd + nerdctl | to pull, convert and push the `dynamo-planner` mirror (run with `sudo`) | containerd 1.7.27, nerdctl 2.4.2 |
+| `soci` CLI | 0.16.1 (from the [soci-snapshotter release](https://github.com/awslabs/soci-snapshotter/releases/tag/v0.16.1)) | 0.16.1 |
+| jq, curl, git, envsubst (gettext), setsid (util-linux) | any | Ubuntu 22.04 packages |
+| Python 3.10+ with `openai==3.46.0` | for DoD 7 | 3.10.12 in a venv |
 
 `scripts/00-check-prereqs.sh` checks all of them.
+
+On Ubuntu with Docker, containerd, jq, curl, git and gettext already installed, this installs the rest into `/usr/local/bin` (run as root):
+
+```bash
+cd "$(mktemp -d)"
+# Terraform
+curl -fsSLO https://releases.hashicorp.com/terraform/1.17.1/terraform_1.17.1_linux_amd64.zip
+python3 -c "import zipfile; zipfile.ZipFile('terraform_1.17.1_linux_amd64.zip').extract('terraform', '.')"
+install -m 0755 terraform /usr/local/bin/terraform
+# Session Manager plugin
+curl -fsSLo smp.deb https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb
+dpkg -i smp.deb
+# kubectl (checksum verified)
+curl -fsSLO https://dl.k8s.io/release/v1.37.2/bin/linux/amd64/kubectl
+curl -fsSLO https://dl.k8s.io/release/v1.37.2/bin/linux/amd64/kubectl.sha256
+echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - && install -m 0755 kubectl /usr/local/bin/kubectl
+# Helm
+curl -fsSL https://get.helm.sh/helm-v3.19.5-linux-amd64.tar.gz | tar xz linux-amd64/helm
+install -m 0755 linux-amd64/helm /usr/local/bin/helm
+# nerdctl (uses the installed containerd)
+curl -fsSL https://github.com/containerd/nerdctl/releases/download/v2.4.2/nerdctl-2.4.2-linux-amd64.tar.gz | tar xz nerdctl
+install -m 0755 nerdctl /usr/local/bin/nerdctl
+# soci CLI (checksum verified)
+f=soci-snapshotter-0.16.1-linux-amd64-static.tar.gz
+curl -fsSLO https://github.com/awslabs/soci-snapshotter/releases/download/v0.16.1/$f
+curl -fsSLO https://github.com/awslabs/soci-snapshotter/releases/download/v0.16.1/$f.sha256sum
+sha256sum -c $f.sha256sum && tar xzf $f soci && install -m 0755 soci /usr/local/bin/soci
+# OpenAI SDK for DoD 7, in a venv of the operator user (not root)
+apt-get install -y python3-venv
+sudo -u "$SUDO_USER" bash -c 'python3 -m venv ~/.venvs/llm-verify && ~/.venvs/llm-verify/bin/pip install openai==3.46.0'
+```
+
+Put `/usr/local/bin` ahead of other locations on `PATH` (for example ahead of `/snap/bin`, if a different Terraform is installed as a snap). Pass the venv to the verification with `VERIFY_PYTHON=~/.venvs/llm-verify/bin/python`.
 
 ### Operator instance (SSM tunnel)
 
 All EKS API endpoints are private. kubectl and Helm reach them through an SSM port-forwarding tunnel via an **operator instance** inside the VPC. You create this instance manually after step 1, and it is not part of this repository. It needs:
 
-- Ubuntu Server 26.04 LTS in one of the VPC's **private** subnets. The SSM agent ships with the Ubuntu AMIs.
-- An instance profile with `AmazonSSMManagedInstanceCore`. The VPC already has endpoints for SSM, ssmmessages and ec2messages.
-- A security group that allows outbound TCP 443 to the VPC CIDR. Every cluster security group accepts 443 from the VPC CIDR.
+- Ubuntu Server 26.04 LTS in one of the VPC's **private** subnets. The SSM agent ships with the Ubuntu AMIs. A `t3.micro` is enough.
+- An instance profile with `AmazonSSMManagedInstanceCore` only. The VPC already has endpoints for SSM, ssmmessages and ec2messages.
+- A security group that allows outbound TCP 443 to the VPC CIDR and nothing else. Every cluster security group accepts 443 from the VPC CIDR.
+
+For example, after step 1 (the role `llm-operator-tunnel` and its instance profile hold only `AmazonSSMManagedInstanceCore`):
+
+```bash
+TF="terraform -chdir=infra/envs/region"
+export AWS_DEFAULT_REGION=$($TF output -json deploy | jq -r .region)
+VPC=$($TF output -json deploy | jq -r .vpc_id)
+SUBNET=$($TF output -json deploy | jq -r '.cells | to_entries[0].value.subnet_id')
+SG=$(aws ec2 create-security-group --group-name llm-operator-tunnel --vpc-id $VPC \
+  --description "SSM tunnel instance: HTTPS to the VPC only" --query GroupId --output text)
+CIDR=$($TF output -json deploy | jq -r .vpc_cidr)
+aws ec2 revoke-security-group-egress --group-id $SG \
+  --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]'
+aws ec2 authorize-security-group-egress --group-id $SG \
+  --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"IpRanges\":[{\"CidrIp\":\"$CIDR\"}]}]"
+AMI=$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text)
+aws ec2 run-instances --image-id $AMI --instance-type t3.micro --subnet-id $SUBNET --security-group-ids $SG \
+  --iam-instance-profile Name=llm-operator-tunnel --metadata-options HttpTokens=required \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=llm-operator-tunnel}]' --query 'Instances[0].InstanceId' --output text
+```
 
 The tunnel carries only the TLS connection. kubectl still authenticates with the operator host's own AWS credentials. That identity must be the one that ran `terraform apply` or be listed in `operator_principal_arns`.
+
+Session Manager closes a session after 20 minutes without traffic (the default idle timeout), which ends a tunnel. `scripts/20-tunnels.sh keepalive` sends one small API request per tunnel each minute and restarts tunnels that have exited; `scripts/deploy.sh` runs it for you. `scripts/20-tunnels.sh start` also restarts exited tunnels.
+
+`scripts/90-teardown.sh` terminates the operator instance, and deletes its security groups that are in the VPC and not managed by Terraform, because the VPC cannot be deleted while they exist.
 
 ## Configure
 
@@ -89,9 +147,11 @@ Set `region`, `hosted_zone_name`, `api_hostname`, the two `cells` (each in a dif
 | `cells.*.efa_enabled` | `true` |
 | `kubernetes_version` | `1.37` |
 
+Choose the cell AZs before the first `terraform apply`. The network module numbers the subnet CIDRs by the position of each AZ in the sorted AZ list, so moving a cell to another AZ later replaces subnets that the other clusters also use. To move a cell, tear the environment down and deploy it again.
+
 ## Deploy order
 
-Run the steps from the repository root. Each step can be re-run.
+Run the steps from the repository root. Each step can be re-run. All script output lines carry a UTC timestamp.
 
 | Step | Command | What it does |
 |---|---|---|
@@ -106,7 +166,24 @@ Run the steps from the repository root. Each step can be re-run.
 | 7 | `scripts/60-router.sh` | Router ConfigMaps (cell list = internal NLB URLs), Deployment and TargetGroupBinding. Waits for healthy ALB targets |
 | 8 | `scripts/70-verify.sh` | Runs every DoD check below |
 | – | `scripts/20-tunnels.sh stop` | Closes the tunnels |
-| – | `scripts/90-teardown.sh` | Deletes the controller-created NLBs and Karpenter nodes, then runs `terraform destroy` |
+| – | `OPERATOR_INSTANCE_ID=i-… scripts/90-teardown.sh [--yes]` | Deletes the TargetGroupBinding, the workloads, the controller-created NLBs and the Karpenter nodes, terminates the operator instance, then runs `terraform destroy` (`--yes` skips both confirmations) |
+
+### Unattended run
+
+`scripts/deploy.sh` runs the steps in order and keeps going without a terminal. Because the operator instance must be in the VPC that step 1 creates, a first deploy runs in two parts:
+
+```bash
+scripts/deploy.sh --to 10                     # steps 0 and 1
+# create the operator instance (see above), then:
+export OPERATOR_INSTANCE_ID=i-… VERIFY_PYTHON=~/.venvs/llm-verify/bin/python
+setsid nohup scripts/deploy.sh --from 20 >/dev/null 2>&1 </dev/null &
+tail -f .state/region/deploy.status
+```
+
+- Each attempt of each step writes `.state/region/logs/<UTC time>-<step>.log`, and `.state/region/deploy.status` gets one timestamped line per attempt and result.
+- A failed step is retried `STEP_RETRIES` more times (default 2) after the tunnels are re-opened. `scripts/10-terraform-apply.sh` is not retried.
+- The runner stops at the first step that still fails. Fix the cause and resume with `--from <step>`.
+- `STUB_ENGINE_TIMEOUT` (default `45m`) sets how long step 6 waits for each cell. Karpenter keeps retrying launches in the background, so a retry of step 6 picks up nodes that arrive late.
 
 To use kubectl yourself, run `export KUBECONFIG=$PWD/.state/region/kubeconfig`. The contexts are named after the clusters: `llm-<region>-router`, `llm-<region>-a` and `llm-<region>-b`.
 
@@ -150,7 +227,7 @@ for c in a b; do
 done
 ```
 
-Each cell shows a `c8i.48xlarge` node in its own AZ with `EFA` = `1`. The `worker` (mocker) pods run on that node, and the `frontend` pods run on system nodes.
+Each cell shows a node of its configured inference instance type (for example `c8i.48xlarge`) in its own AZ with `EFA` = `1`. The `worker` (mocker) pods run on that node, and the `frontend` pods run on system nodes.
 
 ### 3. SOCI lazy-loads the mocker image
 
@@ -223,7 +300,7 @@ for chunk in client.chat.completions.create(model=model, messages=[{"role": "use
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-The ready-made version is `API_URL=$API ACCESS_TOKEN=$TOKEN python3 scripts/verify_openai_sdk.py` (requires `pip install openai==3.46.0`).
+The ready-made version is `API_URL=$API ACCESS_TOKEN=$TOKEN ~/.venvs/llm-verify/bin/python scripts/verify_openai_sdk.py` (requires `openai==3.46.0`; see the operator host install steps).
 
 ### 8. `POST` without `session-id` returns `400`
 

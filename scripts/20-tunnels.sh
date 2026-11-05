@@ -2,7 +2,7 @@
 # Step 2: open SSM port-forwarding tunnels to the private EKS API endpoints and
 # write a kubeconfig with one context per cluster (context name = cluster name).
 #
-# Usage: OPERATOR_INSTANCE_ID=i-... scripts/20-tunnels.sh [start|stop|status]
+# Usage: OPERATOR_INSTANCE_ID=i-... scripts/20-tunnels.sh [start|keepalive|stop|status]
 #
 # The operator instance is an EC2 instance inside the Region VPC with the SSM
 # agent running (created manually; not part of this repository). Tunnels run
@@ -31,22 +31,39 @@ stop_tunnels() {
   ok "tunnels stopped"
 }
 
-start_tunnel() {
-  local cluster="$1" port="$2" endpoint host arn
-  endpoint="$(aws eks describe-cluster --region "$(region)" --name "${cluster}" --query cluster.endpoint --output text)"
-  arn="$(aws eks describe-cluster --region "$(region)" --name "${cluster}" --query cluster.arn --output text)"
-  host="${endpoint#https://}"
+tunnel_running() {
+  [[ -f "$(pid_file "$1")" ]] && kill -0 "$(cat "$(pid_file "$1")")" 2>/dev/null
+}
 
-  if [[ -f "$(pid_file "${cluster}")" ]] && kill -0 "$(cat "$(pid_file "${cluster}")")" 2>/dev/null; then
+# Starts the SSM port-forwarding session for one cluster in its own process
+# group (setsid), unless it is already running.
+start_session() {
+  local cluster="$1" port="$2" host="$3"
+  tunnel_running "${cluster}" && return 0
+  setsid aws ssm start-session \
+    --region "$(region)" \
+    --target "${OPERATOR_INSTANCE_ID}" \
+    --document-name AWS-StartPortForwardingSessionToRemoteHost \
+    --parameters "host=${host},portNumber=443,localPortNumber=${port}" \
+    >>"${STATE_DIR}/tunnel-${cluster}.log" 2>&1 &
+  echo $! >"$(pid_file "${cluster}")"
+}
+
+endpoint_host() {
+  local endpoint
+  endpoint="$(aws eks describe-cluster --region "$(region)" --name "$1" --query cluster.endpoint --output text)"
+  echo "${endpoint#https://}"
+}
+
+start_tunnel() {
+  local cluster="$1" port="$2" host arn
+  host="$(endpoint_host "${cluster}")"
+  arn="$(aws eks describe-cluster --region "$(region)" --name "${cluster}" --query cluster.arn --output text)"
+
+  if tunnel_running "${cluster}"; then
     ok "${cluster}: tunnel already running on 127.0.0.1:${port}"
   else
-    setsid aws ssm start-session \
-      --region "$(region)" \
-      --target "${OPERATOR_INSTANCE_ID}" \
-      --document-name AWS-StartPortForwardingSessionToRemoteHost \
-      --parameters "host=${host},portNumber=443,localPortNumber=${port}" \
-      >"${STATE_DIR}/tunnel-${cluster}.log" 2>&1 &
-    echo $! >"$(pid_file "${cluster}")"
+    start_session "${cluster}" "${port}" "${host}"
   fi
 
   aws eks update-kubeconfig --region "$(region)" --name "${cluster}" --alias "${cluster}" >/dev/null
@@ -76,6 +93,30 @@ case "${action}" in
     echo "Use the same kubeconfig in your shell:"
     echo "  export KUBECONFIG=${KUBECONFIG}"
     ;;
+  keepalive)
+    # Runs until killed. Session Manager closes a session after 20 minutes
+    # without traffic (the default idle timeout), so this sends one small API
+    # request through every tunnel each minute and restarts tunnels that have
+    # exited. The kubeconfig is not rewritten, so it is safe to run next to
+    # other kubectl commands. Run "start" first.
+    require aws session-manager-plugin kubectl jq setsid
+    : "${OPERATOR_INSTANCE_ID:?set OPERATOR_INSTANCE_ID to the operator EC2 instance ID}"
+    declare -A hosts=()
+    while :; do
+      port="${TUNNEL_BASE_PORT}"
+      for cluster in $(clusters); do
+        if ! tunnel_running "${cluster}"; then
+          [[ -n "${hosts[${cluster}]:-}" ]] || hosts[${cluster}]="$(endpoint_host "${cluster}")"
+          fail "${cluster}: tunnel exited; restarting on 127.0.0.1:${port}"
+          start_session "${cluster}" "${port}" "${hosts[${cluster}]}"
+        else
+          kubectl --context "${cluster}" version --request-timeout=10s >/dev/null 2>&1 || true
+        fi
+        port=$((port + 1))
+      done
+      sleep 60
+    done
+    ;;
   stop)
     stop_tunnels
     ;;
@@ -87,6 +128,6 @@ case "${action}" in
     done
     ;;
   *)
-    die "usage: $0 [start|stop|status]"
+    die "usage: $0 [start|keepalive|stop|status]"
     ;;
 esac

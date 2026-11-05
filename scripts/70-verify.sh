@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Step 8: check every Definition of Done item (docs/architecture.md, section 11).
 # Requires the tunnels from scripts/20-tunnels.sh (for DoD 2 and 3) and the
-# openai package for DoD 7 (pip install openai==3.46.0).
+# openai package for DoD 7 (pip install openai==3.46.0). Set VERIFY_PYTHON to
+# a Python that has it, for example a venv: VERIFY_PYTHON=~/.venvs/llm-verify/bin/python.
 source "$(dirname "$0")/lib.sh"
 require terraform aws kubectl jq curl python3
 
@@ -25,9 +26,13 @@ dod1() {
     'module.edge.aws_route53_record.api' \
     'module.regional.aws_ecr_repository.this["router"]' \
     'module.regional.aws_ecr_repository.this["dynamo-planner"]' \
-    'module.regional.module.eks.aws_eks_cluster.this[0]'; do
+    'module.regional.module.cluster.module.eks.aws_eks_cluster.this[0]'; do
     if grep -qxF "${addr}" <<<"${state}"; then ok "${addr}"; else fail "${addr} missing"; ok_all=1; fi
   done
+  local clusters want
+  clusters="$(grep -c 'module.eks.aws_eks_cluster.this\[0\]$' <<<"${state}")"
+  want=$(($(tf_deploy '.cells | length') + 1))
+  if [[ "${clusters}" -eq "${want}" ]]; then ok "${clusters} EKS clusters (router + cells)"; else fail "${clusters} EKS clusters, want ${want}"; ok_all=1; fi
   local azs
   azs="$(tf_deploy '[.cells[].availability_zone] | unique | length')"
   if [[ "$(tf_deploy '.cells | length')" -ge 2 && "${azs}" -ge 2 ]]; then
@@ -135,7 +140,7 @@ dod6() {
 
 dod7() {
   log "DoD 7: official OpenAI Python SDK (base_url, api_key, default_headers)"
-  API_URL="${API}" ACCESS_TOKEN="${TOKEN}" python3 "${SCRIPTS_DIR}/verify_openai_sdk.py"
+  API_URL="${API}" ACCESS_TOKEN="${TOKEN}" "${VERIFY_PYTHON:-python3}" "${SCRIPTS_DIR}/verify_openai_sdk.py"
 }
 
 dod8() {
