@@ -91,6 +91,8 @@ module "lbc_pod_identity" {
   use_name_prefix = false
 
   attach_aws_lb_controller_policy = true
+  # IAM policy names are account-wide: one policy per cluster.
+  aws_lb_controller_policy_name = "${var.cluster_name}-lbc"
 
   associations = {
     this = {
