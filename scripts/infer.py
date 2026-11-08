@@ -16,7 +16,8 @@ What is printed, and where it comes from:
   tokens           usage: input, cached (KV-cache hit), output, total
   client timing    measured here: TTFT (first output_text.delta), total, TPOT
   server timing    Dynamo nvext.timing: TTFT, prefill, total, kv_hit_rate,
-                   router queue depth (requested with nvext.extra_fields)
+                   router queue depth (requested with nvext.extra_fields;
+                   Dynamo 1.6.1 returns nvext only without streaming)
   worker           Dynamo nvext.worker_id: prefill and decode worker
 
 To add a field, add it to build_report(); the text and JSON output both use it.
@@ -176,29 +177,35 @@ def _round(value: Any, digits: int = 1) -> Any:
     return round(value, digits) if isinstance(value, (int, float)) else value
 
 
-def print_report(n: int, report: dict[str, Any]) -> None:
-    def show(label: str, *keys: str, unit: str = "") -> None:
-        values = [report.get(k) for k in keys]
-        if all(v is None for v in values):
-            return
-        print(f"  {label:<16} " + " / ".join("-" if v is None else f"{v}{unit}" for v in values))
+def print_report(n: int, report: dict[str, Any], streamed: bool) -> None:
+    r = report
 
-    print(f"\n#{n}  {report['id']}  {report['model']}")
-    print(f"  {'text':<16} {report['text']!r}")
-    status = report["status"] + (f" ({report['incomplete_reason']})" if report["incomplete_reason"] else "")
-    print(f"  {'status':<16} {status}")
-    print(f"  {'served by':<16} region {report['region']}, cell {report['cell']}, session {report['session_id']}")
-    show("worker p / d", "prefill_worker", "decode_worker")
+    def ms(key: str) -> str:
+        return "-" if r.get(key) is None else f"{r[key]} ms"
+
+    status = r["status"] + (f" ({r['incomplete_reason']})" if r["incomplete_reason"] else "")
+    print(f"\n#{n}  {r['id']}  {r['model']}")
+    print(f"  text         {r['text']!r}")
+    print(f"  status       {status}")
+    print(f"  served by    region {r['region']}, cell {r['cell']}, session {r['session_id']}")
     print(
-        f"  {'tokens':<16} input {report['input_tokens']} (cached {report['cached_tokens']}, "
-        f"{report['cache_hit_pct']}% -> cache {report['cache']}), output {report['output_tokens']}, "
-        f"total {report['total_tokens']}"
+        f"  tokens       input {r['input_tokens']}, cached {r['cached_tokens']} "
+        f"({r['cache_hit_pct']}%, cache {r['cache']}), output {r['output_tokens']}, total {r['total_tokens']}"
     )
-    show("client ms", "client_ttft_ms", "client_total_ms", unit="")
-    print(f"  {'':<16} (TTFT / total; TPOT {report['client_tpot_ms']} ms, {report['client_output_tokens_per_s']} tok/s)")
-    show("server ms", "server_ttft_ms", "server_prefill_ms", "server_total_ms")
-    print(f"  {'':<16} (TTFT / prefill / total; kv_hit_rate {report['server_kv_hit_rate']}, "
-          f"prefill wait {report['server_prefill_wait_ms']} ms, router queue {report['router_queue_depth']})")
+    print(
+        f"  client       TTFT {ms('client_ttft_ms')}, total {ms('client_total_ms')}, "
+        f"TPOT {ms('client_tpot_ms')}, {r['client_output_tokens_per_s']} output tok/s"
+    )
+    if r["server_total_ms"] is None:
+        why = "Dynamo 1.6.1 omits it on streamed Responses calls; use --no-stream" if streamed else "not returned"
+        print(f"  server       (worker and server timing: {why})")
+    else:
+        print(
+            f"  server       TTFT {ms('server_ttft_ms')}, prefill {ms('server_prefill_ms')} "
+            f"(queued {ms('server_prefill_wait_ms')}), total {ms('server_total_ms')}, "
+            f"kv_hit_rate {r['server_kv_hit_rate']}, router queue {r['router_queue_depth']}"
+        )
+        print(f"  worker       prefill {r['prefill_worker']}, decode {r['decode_worker']}")
 
 
 def main() -> int:
@@ -236,7 +243,7 @@ def main() -> int:
         if args.json:
             print(json.dumps(report), flush=True)
         else:
-            print_report(n, report)
+            print_report(n, report, args.stream)
     return 0
 
 
