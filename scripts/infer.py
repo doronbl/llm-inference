@@ -31,11 +31,11 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
-
-import httpx
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 NVEXT_FIELDS = ["worker_id", "timing"]
@@ -67,20 +67,26 @@ def request_body(args: argparse.Namespace, model: str) -> dict[str, Any]:
     return body
 
 
-def call(client: httpx.Client, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+def call(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
     """Sends one request. Returns the final response object, headers and client timings."""
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="POST", headers={**headers, "content-type": "application/json"}
+    )
     start = time.perf_counter()
     first_token_at = None
     text: list[str] = []
     events = 0
     final: dict[str, Any] | None = None
 
-    with client.stream("POST", url, headers=headers, json=body) as resp:
-        if resp.status_code != 200:
-            resp.read()
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+    try:
+        resp = urllib.request.urlopen(request, timeout=300)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from None
+    with resp:
+        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
         if body["stream"]:
-            for line in resp.iter_lines():
+            for raw in resp:  # one SSE line at a time, as it arrives
+                line = raw.decode().rstrip("\r\n")
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
                 event = json.loads(line.removeprefix("data: "))
@@ -92,13 +98,12 @@ def call(client: httpx.Client, url: str, headers: dict[str, str], body: dict[str
                     text.append(event["delta"])
                 elif kind in ("response.completed", "response.incomplete", "response.failed"):
                     final = event["response"]
-                    # Dynamo puts nvext on the event, next to the response.
+                    # Dynamo may put nvext on the event, next to the response.
                     if "nvext" in event and "nvext" not in final:
                         final["nvext"] = event["nvext"]
         else:
             final = json.loads(resp.read())
         end = time.perf_counter()
-        resp_headers = dict(resp.headers)
 
     final = final or {}
     if not text:
@@ -218,20 +223,20 @@ def main() -> int:
     session_id = args.session_id or f"infer-{uuid.uuid4()}"
     headers = {"authorization": f"Bearer {token}", "session-id": session_id}
 
-    with httpx.Client(timeout=httpx.Timeout(10, read=300)) as client:
-        if not model:
-            model = client.get(f"{api}/models", headers=headers).json()["data"][0]["id"]
-        body = request_body(args, model)
-        for n in range(1, args.repeat + 1):
-            try:
-                report = build_report(call(client, f"{api}/responses", headers, body), session_id)
-            except RuntimeError as exc:
-                print(f"#{n}: {exc}", file=sys.stderr)
-                return 1
-            if args.json:
-                print(json.dumps(report))
-            else:
-                print_report(n, report)
+    if not model:
+        with urllib.request.urlopen(urllib.request.Request(f"{api}/models", headers=headers), timeout=30) as resp:
+            model = json.loads(resp.read())["data"][0]["id"]
+    body = request_body(args, model)
+    for n in range(1, args.repeat + 1):
+        try:
+            report = build_report(call(f"{api}/responses", headers, body), session_id)
+        except RuntimeError as exc:
+            print(f"#{n}: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(report), flush=True)
+        else:
+            print_report(n, report)
     return 0
 
 
