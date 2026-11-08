@@ -124,3 +124,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "system_node_tags" {
+  description = "Extra tags for the system node instances and volumes, for example the cell ID. Name, llm-inference/cluster and llm-inference/node-class are set by the module."
+  type        = map(string)
+  default     = {}
+}

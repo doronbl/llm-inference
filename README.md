@@ -206,6 +206,8 @@ TOKEN=$(curl -s \
 MODEL=$(curl -s $API/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id')   # Qwen/Qwen3-0.6B
 ```
 
+`eval "$(scripts/api-env.sh)"` sets `API`, `TOKEN` and `MODEL` in one step (keep `HOST` and `KUBECONFIG` from above for checks 2, 3 and 9). Run it again when the token expires after 60 minutes. Use it instead of sourcing `scripts/lib.sh`: that file is for the scripts and turns on strict shell options.
+
 ### 1. Terraform created the Region
 
 ```bash
@@ -366,6 +368,7 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 
 ## Notes
 
+- **EC2 instance names and tags:** system nodes are named `<cluster>-system` (for example `llm-us-east-1-a-system`) and Karpenter inference nodes `<cluster>-inference`. Every node carries `Project=llm-inference`, `Region`, `llm-inference/cluster`, `llm-inference/role` (`router` or `cell`), `llm-inference/node-class` (`system` or `inference`), and on cell nodes `llm-inference/cell` (`a`, `b`, …). Filter by them in the EC2 console or with `aws ec2 describe-instances --filters Name=tag:llm-inference/cell,Values=a`.
 - **Logs and metrics:** only the default CloudWatch integration is used: EKS control-plane logs plus the EC2, ALB and NLB metrics.
 - **IAM:** in-cluster controllers (Karpenter, Load Balancer Controller) get credentials through EKS Pod Identity associations created by Terraform. The clusters have no OIDC provider.
 - **Downloads at startup:** nodes download nothing at boot. The mocker downloads its tokenizer (`Qwen/Qwen3-0.6B`) from Hugging Face at startup.

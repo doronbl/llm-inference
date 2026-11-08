@@ -41,6 +41,5 @@ spec:
         throughput: 1000
         encrypted: true
         deleteOnTermination: true
-  tags:
-    llm-inference/cell: "${cell_id}"
+  tags: ${jsonencode(instance_tags)}
   userData: ${jsonencode(user_data)}

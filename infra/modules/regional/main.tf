@@ -23,6 +23,7 @@ module "cluster" {
   system_node_volume_size_gib   = var.system_node_volume_size_gib
   system_node_volume_throughput = 250
   node_cloudinit_parts          = var.node_cloudinit_parts
+  system_node_tags              = { "llm-inference/role" = "router" }
 
   node_security_group_additional_rules = {
     ingress_alb_router = {

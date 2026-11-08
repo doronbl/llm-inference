@@ -117,6 +117,14 @@ module "eks" {
         "llm-inference/node-class" = "system"
       }
 
+      # Instance and volume tags. The default Name is the node group key
+      # ("system") on every cluster; name the nodes after their cluster.
+      launch_template_tags = merge(var.system_node_tags, {
+        Name                       = "${var.cluster_name}-system"
+        "llm-inference/cluster"    = var.cluster_name
+        "llm-inference/node-class" = "system"
+      })
+
       cloudinit_pre_nodeadm = var.node_cloudinit_parts
 
       block_device_mappings = {

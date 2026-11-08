@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Shared helpers for the deploy scripts. Source it; do not run it.
+# Shared helpers for the deploy scripts: source it from a script. It enables
+# strict mode (set -euo pipefail), so for an interactive shell use
+# scripts/api-env.sh instead.
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
