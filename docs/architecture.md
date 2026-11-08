@@ -134,6 +134,7 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 - **Authentication:** `Authorization: Bearer <Cognito access token>`.
 - **Session header:** `session-id` (**required** on `POST` endpoints; identifies the conversation; used for cell pinning). Missing → `400`. Not required on `GET /v1/models`.
 - **Response headers (for debugging):** `x-served-region`, `x-served-cell`.
+- **Inference metadata in the response body:** `usage` (input, cached and output tokens; `cached_tokens` is the KV-cache hit), and, when the request asks for it with `"nvext": {"extra_fields": ["worker_id", "timing"]}`, Dynamo's `nvext` object with the prefill and decode worker and server-side timing (TTFT, prefill, total, `kv_hit_rate`). Dynamo 1.6.1 returns `nvext` on non-streaming requests only. `scripts/infer` prints all of it.
 
 ---
 

@@ -262,6 +262,26 @@ You should see `event: response.created`, then `response.output_text.delta` even
 
 Only the Responses API and the model list are routed. `POST $API/chat/completions` and `POST $API/completions` return `404`; `scripts/70-verify.sh` checks this too.
 
+### Inspect a single request: `scripts/infer`
+
+`scripts/infer` sends Responses API requests and prints the answer together with its metadata. It needs only `python3` and gets the API URL and a token from `scripts/api-env.sh` (or from `API`/`TOKEN` in the environment).
+
+```bash
+scripts/infer "Hello"                                         # streaming
+scripts/infer --no-stream --repeat 3 --input-file prompt.txt  # repeats show KV-cache hits
+scripts/infer --json "Hello" | jq .                           # machine-readable, one object per request
+```
+
+| Printed | Source |
+|---|---|
+| cell, region | `x-served-cell`, `x-served-region` response headers, set by the router |
+| tokens, cache hit or miss | `usage`: `input_tokens`, `input_tokens_details.cached_tokens` (prompt tokens served from the cell's KV cache, counted in full blocks), `output_tokens` |
+| client TTFT, total, TPOT | Measured by the script: first `response.output_text.delta`, end of the response |
+| server TTFT, prefill, total, `kv_hit_rate`, router queue | Dynamo `nvext.timing`, requested with `"nvext": {"extra_fields": ["worker_id", "timing"]}`. Dynamo 1.6.1 returns `nvext` only on non-streaming calls (`--no-stream`) |
+| prefill and decode worker | Dynamo `nvext.worker_id` |
+
+A cache hit needs a prompt prefix of at least one KV block that the same cell has seen before, from any session. A short prompt like `Hello` always shows `cached 0`. New fields go into `build_report()` in `scripts/infer.py`; the text and JSON output both use it.
+
 ### 5. The same `session-id` always hits the same cell
 
 ```bash
