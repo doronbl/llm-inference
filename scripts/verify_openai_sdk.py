@@ -1,6 +1,7 @@
 """Definition of Done 7: the official OpenAI Python SDK works against the API
-with only base_url, api_key (= Cognito access token) and a session-id header
-in default_headers.
+(Responses API: client.responses.create, non-streaming and streaming) with
+only base_url, api_key (= Cognito access token) and a session-id header in
+default_headers.
 
 Usage:
     pip install openai==3.46.0
@@ -27,32 +28,34 @@ def main() -> int:
     model = client.models.list().data[0].id
     print(f"model: {model}")
 
-    raw = client.chat.completions.with_raw_response.create(
+    raw = client.responses.with_raw_response.create(
         model=model,
-        messages=[{"role": "user", "content": "Say hello."}],
-        max_tokens=16,
+        instructions="Answer briefly.",
+        input="Say hello.",
+        max_output_tokens=16,
     )
-    completion = raw.parse()
-    print(f"non-streaming: {completion.choices[0].message.content!r}")
+    response = raw.parse()
+    print(f"non-streaming ({response.status}): {response.output_text!r}")
     print(f"  x-served-region={raw.headers.get('x-served-region')} x-served-cell={raw.headers.get('x-served-cell')}")
 
-    text = []
-    stream = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": "Count to five."}],
-        max_tokens=16,
-        stream=True,
-    )
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            text.append(chunk.choices[0].delta.content)
-    print(f"streaming: {''.join(text)!r}")
+    # The API is stateless: send the conversation so far as the input.
+    history = [
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": response.output_text},
+        {"role": "user", "content": "Count to five."},
+    ]
+    text, event_types = [], []
+    for event in client.responses.create(model=model, input=history, max_output_tokens=16, stream=True):
+        event_types.append(event.type)
+        if event.type == "response.output_text.delta":
+            text.append(event.delta)
+    print(f"streaming: {''.join(text)!r} ({event_types[0]} ... {event_types[-1]}, {len(event_types)} events)")
 
-    legacy = client.completions.create(model=model, prompt="Hello", max_tokens=8)
-    print(f"completions: {legacy.choices[0].text!r}")
-
-    if not completion.choices or not text:
+    if not response.output_text or not text:
         print("FAIL: empty response", file=sys.stderr)
+        return 1
+    if event_types[-1] not in ("response.completed", "response.incomplete"):
+        print(f"FAIL: stream ended with {event_types[-1]}", file=sys.stderr)
         return 1
     print("OK: OpenAI SDK works with base_url, api_key and default_headers only")
     return 0

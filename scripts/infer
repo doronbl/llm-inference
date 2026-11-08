@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs scripts/infer.py (standard library only) with python3.
+#   scripts/infer "Hello"            scripts/infer --help
+exec python3 "$(cd "$(dirname "$0")" && pwd)/infer.py" "$@"

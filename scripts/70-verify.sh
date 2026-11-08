@@ -97,27 +97,49 @@ dod2_3() {
 }
 
 ################################################################################
+# Request body for POST /v1/responses with a short output.
+responses_body() {
+  jq -nc --arg model "${MODEL}" --arg input "$1" --argjson stream "${2:-false}" \
+    '{model: $model, input: $input, max_output_tokens: 16, stream: $stream}'
+}
+
 dod4() {
-  log "DoD 4: streaming chat completion returns OpenAI SSE chunks ending with data: [DONE]"
+  log "DoD 4: streaming Responses API call returns OpenAI response events, a terminal event, then data: [DONE]"
   local body
-  body="$(curl --silent --show-error --no-buffer "${API}/chat/completions" \
+  body="$(curl --silent --show-error --no-buffer "${API}/responses" \
     -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" -H "session-id: dod4-$(date +%s)" \
-    -d "{\"model\":\"${MODEL}\",\"stream\":true,\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}")"
-  local data last
+    -d "$(responses_body Hello true)")"
+  local data types first final deltas
   data="$(grep '^data: ' <<<"${body}" || true)"
-  last="$(tail -n1 <<<"${data}")"
-  if [[ "${last}" == "data: [DONE]" ]] && grep -v '^data: \[DONE\]' <<<"${data}" | head -1 | sed 's/^data: //' \
-      | jq -e '.object == "chat.completion.chunk"' >/dev/null; then
-    ok "$(($(wc -l <<<"${data}") - 1)) chat.completion.chunk events, then data: [DONE]"
+  types="$(grep -v '^data: \[DONE\]' <<<"${data}" | sed 's/^data: //' | jq -r '.type' 2>/dev/null || true)"
+  first="$(head -n1 <<<"${types}")"
+  final="$(tail -n1 <<<"${types}")"
+  deltas="$(grep -c '^response.output_text.delta$' <<<"${types}" || true)"
+  # The mocker stops at max_output_tokens, so the terminal event is usually
+  # response.incomplete; a model that finishes first sends response.completed.
+  if [[ "$(tail -n1 <<<"${data}")" == "data: [DONE]" && "${first}" == "response.created" && "${deltas}" -ge 1 \
+        && "${final}" =~ ^response\.(completed|incomplete)$ ]]; then
+    ok "response.created, ${deltas} response.output_text.delta events, ${final}, then data: [DONE]"
   else
     fail "unexpected stream:"; echo "${body}" | head -20; return 1
   fi
 }
 
+dod4_only_responses() {
+  log "DoD 4: only the Responses API and the model list are routed"
+  local rc=0 path code
+  for path in chat/completions completions; do
+    code="$(curl --silent --output /dev/null --write-out '%{http_code}' "${API}/${path}" \
+      -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" -H "session-id: dod4" -d '{}')"
+    if [[ "${code}" == "404" ]]; then ok "POST /v1/${path}: 404"; else fail "POST /v1/${path}: ${code} (want 404)"; rc=1; fi
+  done
+  return "${rc}"
+}
+
 served_cell() {
-  curl --silent --output /dev/null --dump-header - "${API}/chat/completions" \
+  curl --silent --output /dev/null --dump-header - "${API}/responses" \
     -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" -H "session-id: $1" \
-    -d "{\"model\":\"${MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    -d "$(responses_body hi)" \
     | tr -d '\r' | awk -F': ' 'tolower($1)=="x-served-cell"{print $2}'
 }
 
@@ -146,9 +168,9 @@ dod7() {
 dod8() {
   log "DoD 8: POST without session-id returns 400 with an OpenAI-format error"
   local out code body
-  out="$(curl --silent --write-out '\n%{http_code}' "${API}/chat/completions" \
+  out="$(curl --silent --write-out '\n%{http_code}' "${API}/responses" \
     -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-    -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")"
+    -d "$(responses_body hi)")"
   code="$(tail -n1 <<<"${out}")"; body="$(sed '$d' <<<"${out}")"
   echo "${code} ${body}"
   if [[ "${code}" == "400" ]] && jq -e '.error.code == "missing_session_id" and .error.type == "invalid_request_error" and (.error.message | length > 0)' <<<"${body}" >/dev/null; then
@@ -161,9 +183,9 @@ dod8() {
 dod9() {
   log "DoD 9: no/invalid token -> 401; port 80 not reachable"
   local rc=0 code
-  code="$(curl --silent --output /dev/null --write-out '%{http_code}' "${API}/chat/completions" -H "session-id: s" -d '{}')"
+  code="$(curl --silent --output /dev/null --write-out '%{http_code}' "${API}/responses" -H "session-id: s" -d '{}')"
   if [[ "${code}" == "401" ]]; then ok "no token: 401"; else fail "no token: ${code}"; rc=1; fi
-  code="$(curl --silent --output /dev/null --write-out '%{http_code}' "${API}/chat/completions" \
+  code="$(curl --silent --output /dev/null --write-out '%{http_code}' "${API}/responses" \
     -H "Authorization: Bearer not-a-valid-token" -H "session-id: s" -d '{}')"
   if [[ "${code}" == "401" ]]; then ok "invalid token: 401"; else fail "invalid token: ${code}"; rc=1; fi
   if curl --silent --output /dev/null --connect-timeout 5 --max-time 8 "http://${HOST}/v1/models"; then
@@ -183,6 +205,7 @@ log "API ${API}, model ${MODEL}"
 check dod1
 check dod2_3
 check dod4
+check dod4_only_responses
 check dod5
 check dod6
 check dod7

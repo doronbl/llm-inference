@@ -100,24 +100,32 @@ class FakeCells:
             return _json_response({"object": "list", "data": [{"id": "Qwen/Qwen3-0.6B", "object": "model"}]})
 
         body = json.loads(request.content or b"{}")
+        text = f"Hello from {cell}"
+        response = {
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+            ],
+        }
         if body.get("stream"):
-            chunks = [
-                {"id": "c1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": word}}]}
-                for word in ("Hello", " from", f" {cell}")
-            ]
-            payload = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+            # Responses API streaming: typed events, then data: [DONE] (as the
+            # Dynamo frontend sends it).
+            events = [{"type": "response.created", "response": {**response, "status": "in_progress", "output": []}}]
+            events += [{"type": "response.output_text.delta", "delta": word} for word in ("Hello", " from", f" {cell}")]
+            events += [{"type": "response.completed", "response": response}]
+            payload = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream", "x-served-cell": "spoofed"},
                 stream=httpx.ByteStream(payload.encode()),
             )
-        return _json_response(
-            {
-                "id": "c1",
-                "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": f"Hello from {cell}"}}],
-            }
-        )
+        return _json_response(response)
 
 
 class FakeJWKClient(jwt.PyJWKClient):
