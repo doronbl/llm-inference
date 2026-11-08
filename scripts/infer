@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Runs scripts/infer.py with a Python that has httpx (installed with the
+# openai package): VERIFY_PYTHON if set, else ~/.venvs/llm-verify, else python3.
+#   scripts/infer "Hello"            scripts/infer --help
+here="$(cd "$(dirname "$0")" && pwd)"
+py="${VERIFY_PYTHON:-${HOME}/.venvs/llm-verify/bin/python}"
+[[ -x "${py}" ]] || py=python3
+exec "${py}" "${here}/infer.py" "$@"
