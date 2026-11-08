@@ -7,9 +7,9 @@
 
 ## 1. Goals
 
-- Serve open-weight LLMs through an **OpenAI-compatible HTTPS API** on a **single domain**.
+- Serve open-weight LLMs through the **OpenAI Responses API** (HTTPS) on a **single domain**.
 - Use a **cell-based architecture**: each cell is an independent EKS cluster pinned to one Availability Zone.
-- Keep routing **stateless and server-side**: any plain HTTP client (curl, any OpenAI-compatible SDK) that sends the required `session-id` header and a valid access token is routed correctly with no client-side routing logic.
+- Keep routing **stateless and server-side**: any plain HTTP client (curl, any OpenAI SDK with Responses API support) that sends the required `session-id` header and a valid access token is routed correctly with no client-side routing logic.
 - **Pin each session to one cell** so its KV cache is reused.
 - Start in **one AWS Region** (configurable) with multiple cells. Adding Regions later must only require new configuration, not changes to the design.
 - First milestone: a **stub deployment that works end to end** on CPU instances (no GPUs).
@@ -19,8 +19,8 @@
 ## 2. High-Level Architecture
 
 ```
-Client (standard HTTP / OpenAI-compatible SDK)
-   │   https://<api_hostname>/v1/...
+Client (standard HTTP / OpenAI SDK, Responses API)
+   │   https://<api_hostname>/v1/responses
    │   Authorization: Bearer <Cognito access token (JWT)>
    │   session-id: <conversation id>
    ▼
@@ -34,7 +34,7 @@ Regional Router cluster (1 EKS cluster per Region)
    │   - cell = sha256(session-id) mod N_cells
    ▼
 Cell k (1 EKS cluster, 1 AZ), reached through an internal NLB
-   │   NVIDIA Dynamo frontend (OpenAI API) + KV Router
+   │   NVIDIA Dynamo frontend (OpenAI Responses API) + KV Router
    ▼
 Dynamo workers on Karpenter inference nodes (Dynamo mocker in v1, vLLM later)
 ```
@@ -119,16 +119,18 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
   - Public ALB, its listener, ACM certificate, JWT verification rule, and target group are created by **Terraform**. Router pods are registered into the target group by the **AWS Load Balancer Controller** via `TargetGroupBinding` (IP targets).
   - Internal NLB per cell is created by the **AWS Load Balancer Controller** from a Kubernetes `Service` of type `LoadBalancer` (internal, IP targets) in front of the Dynamo frontend. It is a separate Service because the Service the Dynamo operator creates for the frontend is always ClusterIP.
   - ALB idle timeout 3600 s to support long SSE streams.
+  - The ALB forwards every path to the router; the router alone decides which endpoints exist (section 7).
   - ALB security group: inbound 443 from the internet; outbound to the router port in the VPC, and outbound 443 to the internet, because the JWT verification fetches the Cognito JWKS through the ALB's own network interfaces.
 
 ---
 
 ## 7. API Contract
 
-- **OpenAI-compatible** endpoints (served by the Dynamo frontend, proxied by the router):
-  - `POST /v1/chat/completions` (streaming over SSE, and non-streaming)
-  - `POST /v1/completions`
-  - `GET /v1/models`
+- **OpenAI Responses API** only (served by the Dynamo frontend, proxied by the router):
+  - `POST /v1/responses` (streaming over SSE with typed `response.*` events, and non-streaming)
+  - `GET /v1/models` (model list, used by `client.models.list()`)
+  - Every other path (including `/v1/chat/completions` and `/v1/completions`) returns `404` at the router, even though the Dynamo frontend inside the cells also serves them.
+- **Conversation state:** stateless. The client sends the conversation so far in `input` (with optional `instructions`) on every turn. `previous_response_id` and response storage (`store`, `GET /v1/responses/{id}`) are not supported: the Dynamo 1.6.1 frontend rejects `previous_response_id` with `501`. KV-cache reuse comes from session pinning and the KV Router, not from server-side conversation state.
 - **Authentication:** `Authorization: Bearer <Cognito access token>`.
 - **Session header:** `session-id` (**required** on `POST` endpoints; identifies the conversation; used for cell pinning). Missing → `400`. Not required on `GET /v1/models`.
 - **Response headers (for debugging):** `x-served-region`, `x-served-cell`.
@@ -216,10 +218,10 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 1. `terraform apply` for one Region creates: VPC, ACM certificate, Cognito user pool and app client, public ALB, Route 53 record, ECR repositories, the regional router cluster, and **two cells** in two different AZs.
 2. The Dynamo mocker runs on Karpenter inference nodes (the configured inference instance type, `c8i.48xlarge` or `c7i.48xlarge`; EFA interfaces attached and visible as `vpc.amazonaws.com/efa` on the node) in each cell, behind the Dynamo frontend.
 3. SOCI is active on the inference nodes: the mocker pod's image (from the ECR `dynamo-planner` mirror with a SOCI index) is lazy-loaded, verified with `findmnt --source soci` on the node through SSM.
-4. `curl https://<api_hostname>/v1/chat/completions` with a valid Cognito access token and `"stream": true` returns OpenAI-format SSE chunks ending with `data: [DONE]`.
+4. `curl https://<api_hostname>/v1/responses` with a valid Cognito access token and `"stream": true` returns OpenAI Responses API events (`response.created`, `response.output_text.delta` …, a terminal `response.completed` or `response.incomplete`) ending with `data: [DONE]`. `POST /v1/chat/completions` and `POST /v1/completions` return `404`.
 5. Repeated requests with the same `session-id` always return the same `x-served-cell`.
 6. Requests with different `session-id` values are spread across both cells.
-7. The official OpenAI Python SDK works against the endpoint with `base_url`, `api_key = <access token>`, and `session-id` sent through `default_headers`.
+7. The official OpenAI Python SDK (`client.responses.create`, streaming and non-streaming) works against the endpoint with `base_url`, `api_key = <access token>`, and `session-id` sent through `default_headers`.
 8. A `POST` request without `session-id` returns `400` with an OpenAI-format error body.
 9. A request without a valid token is rejected with `401`, and port 80 is not reachable.
 

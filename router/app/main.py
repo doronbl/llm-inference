@@ -1,5 +1,7 @@
 """Regional router (tier 2).
 
+Public endpoints: POST /v1/responses (OpenAI Responses API) and GET /v1/models.
+
 For every request:
   1. verify the Cognito access token,
   2. on POST, require a non-empty session-id header,
@@ -167,12 +169,10 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request) -> Response:
-        return await handle(request, require_session=True)
-
-    @app.post("/v1/completions")
-    async def completions(request: Request) -> Response:
+    # The public API is the OpenAI Responses API plus the model list. Other
+    # paths the Dynamo frontend serves are not routed and return 404 here.
+    @app.post("/v1/responses")
+    async def responses(request: Request) -> Response:
         return await handle(request, require_session=True)
 
     @app.get("/v1/models")

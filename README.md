@@ -1,6 +1,6 @@
 # Cell-based LLM inference on Amazon EKS: stub milestone
 
-An OpenAI-compatible HTTPS API on one hostname, served by a cell-based platform on Amazon EKS. This repository implements **Phase 1: the stub milestone**. Each cell runs NVIDIA Dynamo (frontend + KV Router) with the Dynamo **mocker** as a fake engine on CPU instances. The design and the Definition of Done (DoD) are in [`docs/architecture.md`](docs/architecture.md).
+An HTTPS API on one hostname that implements the OpenAI Responses API (`POST /v1/responses`), served by a cell-based platform on Amazon EKS. This repository implements **Phase 1: the stub milestone**. Each cell runs NVIDIA Dynamo (frontend + KV Router) with the Dynamo **mocker** as a fake engine on CPU instances. The design and the Definition of Done (DoD) are in [`docs/architecture.md`](docs/architecture.md).
 
 ```
 client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM TLS, Cognito JWT check)
@@ -250,23 +250,25 @@ SOCI runs only on inference nodes. They use the snapshotter that ships in the AL
 
 If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
 
-### 4. Streaming returns OpenAI SSE chunks ending with `data: [DONE]`
+### 4. Streaming Responses API call returns response events ending with `data: [DONE]`
 
 ```bash
-curl -N $API/chat/completions \
+curl -N $API/responses \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -H "session-id: demo-1" \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}"
+  -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_output_tokens\":16,\"input\":\"Hello\"}"
 ```
 
-You should see `data: {"object":"chat.completion.chunk",…}` lines, with `data: [DONE]` last.
+You should see `event: response.created`, then `response.output_text.delta` events, a terminal `response.completed` (or `response.incomplete` when `max_output_tokens` is reached, which is what the mocker does), and `data: [DONE]` last.
+
+Only the Responses API and the model list are routed. `POST $API/chat/completions` and `POST $API/completions` return `404`; `scripts/70-verify.sh` checks this too.
 
 ### 5. The same `session-id` always hits the same cell
 
 ```bash
 for i in $(seq 10); do
-  curl -s -o /dev/null -D - $API/chat/completions \
+  curl -s -o /dev/null -D - $API/responses \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -H "session-id: sticky-42" \
-    -d "{\"model\":\"$MODEL\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    -d "{\"model\":\"$MODEL\",\"max_output_tokens\":16,\"input\":\"hi\"}" \
     | grep -i '^x-served-cell'
 done | sort | uniq -c
 ```
@@ -277,9 +279,9 @@ The result is a single line, for example `10 x-served-cell: b`.
 
 ```bash
 for i in $(seq 20); do
-  curl -s -o /dev/null -D - $API/chat/completions \
+  curl -s -o /dev/null -D - $API/responses \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -H "session-id: conv-$i" \
-    -d "{\"model\":\"$MODEL\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    -d "{\"model\":\"$MODEL\",\"max_output_tokens\":16,\"input\":\"hi\"}" \
     | grep -i '^x-served-cell'
 done | sort | uniq -c
 ```
@@ -297,9 +299,19 @@ client = OpenAI(
     default_headers={"session-id": "sdk-demo-1"},
 )
 model = client.models.list().data[0].id
-print(client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
-for chunk in client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Hi"}], stream=True):
-    print(chunk.choices[0].delta.content or "", end="")
+
+response = client.responses.create(model=model, instructions="Answer briefly.", input="Hi", max_output_tokens=64)
+print(response.output_text)
+
+# The API is stateless: send the conversation so far as the input of the next turn.
+history = [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": response.output_text},
+    {"role": "user", "content": "Tell me more."},
+]
+for event in client.responses.create(model=model, input=history, max_output_tokens=64, stream=True):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
 ```
 
 The ready-made version is `API_URL=$API ACCESS_TOKEN=$TOKEN ~/.venvs/llm-verify/bin/python scripts/verify_openai_sdk.py` (requires `openai==3.46.0`; see the operator host install steps).
@@ -307,8 +319,8 @@ The ready-made version is `API_URL=$API ACCESS_TOKEN=$TOKEN ~/.venvs/llm-verify/
 ### 8. `POST` without `session-id` returns `400`
 
 ```bash
-curl -i $API/chat/completions -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+curl -i $API/responses -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"input\":\"hi\"}"
 ```
 
 The response is `HTTP/2 400` with this body:
@@ -332,7 +344,8 @@ The ALB rejects these requests before they reach the cluster. The router checks 
 
 | Behavior | Detail |
 |---|---|
-| Endpoints | `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, plus `GET /healthz` for the ALB health check |
+| Endpoints | `POST /v1/responses` (OpenAI Responses API, streaming and non-streaming) and `GET /v1/models`, plus `GET /healthz` for the ALB health check. Other paths return `404` |
+| Conversation state | Stateless. Clients send the conversation so far in `input` on every turn. `previous_response_id` is rejected by the Dynamo frontend (`501`), and stored responses cannot be retrieved |
 | Authentication | The Cognito access token must have a valid RS256 signature, the right `iss`, an unexpired `exp`, `token_use=access`, and the required scope. Signing keys come from PyJWT's `PyJWKClient` (cached). An unreachable JWKS endpoint returns `503` |
 | Cell selection | `int(sha256(session-id)) mod N`, over the cell order in the `router-cells` ConfigMap. Append new cells at the end. Changing the list remaps some sessions, which then start cold in their new cell |
 | Proxying | Raw bytes are passed through as they arrive, so SSE is not buffered. `Authorization` is not forwarded to cells. The router adds `x-served-region` and `x-served-cell` |
@@ -346,7 +359,7 @@ pip install -e '.[test]'
 pytest
 ```
 
-The tests cover routing determinism (including independence from `PYTHONHASHSEED`), distribution across cells, authentication (including the `503` when the JWKS is unreachable), the `400` cases, SSE pass-through and response headers.
+The tests cover routing determinism (including independence from `PYTHONHASHSEED`), distribution across cells, authentication (including the `503` when the JWKS is unreachable), the `400` cases, the `404` for endpoints other than `/v1/responses` and `/v1/models`, Responses API SSE pass-through and response headers.
 
 ## Later phases need configuration changes only
 
