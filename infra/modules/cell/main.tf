@@ -73,6 +73,10 @@ module "cluster" {
   system_node_volume_size_gib   = var.system_node_volume_size_gib
   system_node_volume_throughput = 500
   node_cloudinit_parts          = var.node_cloudinit_parts
+  system_node_tags = {
+    "llm-inference/role" = "cell"
+    "llm-inference/cell" = var.cell_id
+  }
 
   node_security_group_tags = {
     "karpenter.sh/discovery" = local.cluster_name
@@ -220,8 +224,17 @@ locals {
       security_group_ids   = [module.cluster.node_security_group_id, aws_security_group.efa.id]
       placement_group_name = aws_placement_group.inference.name
       network_interfaces   = local.inference_network_interfaces
-      cell_id              = var.cell_id
       user_data            = data.cloudinit_config.inference.rendered
+      # Karpenter launches these instances, so provider default tags do not
+      # reach them; set the project tags and a cluster-specific Name here.
+      instance_tags = merge(var.tags, {
+        Name                       = "${local.cluster_name}-inference"
+        "llm-inference/cluster"    = local.cluster_name
+        "llm-inference/role"       = "cell"
+        "llm-inference/cell"       = var.cell_id
+        "llm-inference/node-class" = "inference"
+        ManagedBy                  = "karpenter"
+      })
     }),
     templatefile("${var.platform_dir}/karpenter/nodepool.yaml.tftpl", {
       cell_id           = var.cell_id
