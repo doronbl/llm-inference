@@ -1,0 +1,35 @@
+# NVIDIA Kubernetes device plugin (chart nvdp/nvidia-device-plugin, version
+# pinned in scripts/versions.env). Installed on every cell cluster, in
+# kube-system.
+#
+# Advertises each node's GPUs as the nvidia.com/gpu resource and hands one
+# GPU to each container that requests it. The NVIDIA variant of the EKS
+# AL2023 AMI (Karpenter picks it for GPU instance types) already has the
+# driver and the NVIDIA container runtime, so only the plugin is installed:
+# no GPU Operator, no Node Feature Discovery, no GPU Feature Discovery.
+
+# The chart's default affinity needs Node Feature Discovery labels. Karpenter
+# labels every node it launches with the instance's GPU count instead, so the
+# plugin runs on GPU inference nodes only (not on CPU stub nodes).
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: llm-inference/node-class
+              operator: In
+              values: ["inference"]
+            - key: karpenter.k8s.aws/instance-gpu-count
+              operator: Gt
+              values: ["0"]
+
+tolerations:
+  - key: llm-inference/inference
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: CriticalAddonsOnly
+    operator: Exists

@@ -31,14 +31,30 @@ variable "vpc_cidr" {
 variable "cells" {
   description = "Cells of this Region, keyed by cell_id. Each cell is pinned to its own Availability Zone."
   type = map(object({
-    availability_zone       = string
-    inference_instance_type = optional(string, "c8i.48xlarge")
-    efa_enabled             = optional(bool, true)
+    availability_zone        = string
+    inference_instance_type  = optional(string, "c8i.48xlarge")
+    efa_enabled              = optional(bool, true)
+    inference_capacity_types = optional(list(string), ["on-demand"])
+    soci_pull_mode           = optional(string, "parallel")
   }))
 
   validation {
     condition     = length(var.cells) >= 1
     error_message = "Define at least one cell."
+  }
+
+  validation {
+    condition = alltrue([
+      for c in values(var.cells) : length(c.inference_capacity_types) > 0 && alltrue([
+        for t in c.inference_capacity_types : contains(["on-demand", "spot"], t)
+      ])
+    ])
+    error_message = "inference_capacity_types must be a non-empty list of \"on-demand\" and/or \"spot\"."
+  }
+
+  validation {
+    condition     = alltrue([for c in values(var.cells) : contains(["parallel", "lazy"], c.soci_pull_mode)])
+    error_message = "soci_pull_mode must be \"parallel\" or \"lazy\"."
   }
 
   validation {

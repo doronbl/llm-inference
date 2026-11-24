@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Step 7: deploy the regional router and bind it to the ALB target group.
-# The cell list (id + internal NLB URL) comes from scripts/50-stub-engine.sh.
+# The cell list (id + internal NLB URL) comes from scripts/50-engine.sh.
 source "$(dirname "$0")/lib.sh"
 require kubectl jq envsubst aws
 image_env
@@ -10,7 +10,7 @@ REGION="$(region)"
 
 cells_json="[]"
 for id in $(cell_ids); do
-  [[ -f "${STATE_DIR}/cell-${id}.nlb" ]] || die "no NLB for cell ${id}; run scripts/50-stub-engine.sh first"
+  [[ -f "${STATE_DIR}/cell-${id}.nlb" ]] || die "no NLB for cell ${id}; run scripts/50-engine.sh first"
   url="http://$(cat "${STATE_DIR}/cell-${id}.nlb"):8000"
   cells_json="$(jq -c --arg id "${id}" --arg url "${url}" '. + [{id: $id, url: $url}]' <<<"${cells_json}")"
 done

@@ -1,5 +1,7 @@
 #!/bin/bash
-# Configures the AMI's SOCI snapshotter for lazy loading.
+# Configures the AMI's SOCI snapshotter for lazy loading. Added to the
+# inference node user data only when the cell's soci_pull_mode is "lazy"
+# (infra/modules/cell); the default "parallel" keeps the AMI configuration.
 #
 # nodeadm (FastImagePull) writes /etc/soci-snapshotter-grpc/config.toml with
 # two settings that this script changes:

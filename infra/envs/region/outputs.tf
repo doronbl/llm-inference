@@ -33,6 +33,9 @@ output "deploy" {
         cluster_endpoint             = c.cluster_endpoint
         subnet_id                    = c.subnet_id
         inference_instance_type      = c.inference_instance_type
+        inference_capacity_types     = c.inference_capacity_types
+        soci_pull_mode               = c.soci_pull_mode
+        instance_store_raid0         = c.instance_store_raid0
         efa_interface_count          = c.efa_interface_count
         karpenter_interruption_queue = c.karpenter_interruption_queue
         karpenter_manifests          = c.karpenter_manifests

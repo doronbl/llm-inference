@@ -6,22 +6,32 @@ api_hostname     = "<api-hostname>"         # for example api.example.com
 
 vpc_cidr = "10.0.0.0/16"
 
-# Two cells, each pinned to a different Availability Zone of the Region.
+# Phase 2: one GPU cell. One p5en.48xlarge Spot instance (8 x H200) runs the
+# eight vLLM workers of workloads/vllm/. Pick an AZ that offers p5en and has
+# Spot capacity for it. Changing a cell's AZ after the first apply requires a
+# teardown and a new deploy.
 cells = {
-# Pick AZs with on-demand capacity for the inference instance type. Changing
-# a cell's AZ after the first apply requires a teardown and a new deploy.
-# c7i.48xlarge has the same EFA layout and can replace c8i.48xlarge.
   a = {
-    availability_zone       = "<region>a"
-    inference_instance_type = "c8i.48xlarge"
-    efa_enabled             = true
+    availability_zone        = "<region>a"
+    inference_instance_type  = "p5en.48xlarge"
+    efa_enabled              = true
+    inference_capacity_types = ["spot"]     # ["spot", "on-demand"] lets Karpenter fall back to on-demand
+    soci_pull_mode           = "parallel"   # or "lazy" (lazy loading of images with a SOCI index)
   }
-  b = {
-    availability_zone       = "<region>b"
-    inference_instance_type = "c8i.48xlarge"
-    efa_enabled             = true
-  }
+
+  # Phase 1 stub cell (CPU, Dynamo mocker; deploy with ENGINE=stub):
+  # b = {
+  #   availability_zone       = "<region>b"
+  #   inference_instance_type = "c8i.48xlarge"   # c7i.48xlarge has the same EFA layout
+  #   efa_enabled             = true
+  #   soci_pull_mode          = "lazy"           # Phase 1 DoD 3: lazy loading of the mocker image
+  # }
+  # ENGINE applies to every cell, so GPU and CPU cells cannot run side by side.
 }
+
+# The EKS control planes and the ALB need subnets in at least two AZs. With a
+# single cell, name a second AZ here (no nodes run in it).
+extra_azs = ["<region>b"]
 
 regional_system_instance_types = ["c8i.xlarge"]
 cell_system_instance_types     = ["c8i.2xlarge"]

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Step 5: add-ons on every cell cluster:
 #   AWS Load Balancer Controller, Karpenter (+ the inference EC2NodeClass and
-#   NodePool rendered by Terraform), EFA device plugin, Dynamo platform
-#   (operator only). IAM comes from EKS Pod Identity associations created by
+#   NodePool rendered by Terraform), EFA device plugin, NVIDIA device plugin
+#   (runs on GPU inference nodes only), Dynamo platform (operator only). IAM comes from EKS Pod Identity associations created by
 #   Terraform, so no service-account annotations are set here.
 # Requires the tunnels from scripts/20-tunnels.sh.
 source "$(dirname "$0")/lib.sh"
@@ -12,6 +12,7 @@ REGION="$(region)"
 VPC_ID="$(tf_deploy '.vpc_id')"
 
 helm repo add eks https://aws.github.io/eks-charts --force-update >/dev/null
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin --force-update >/dev/null
 
 for id in $(cell_ids); do
   CTX="$(cell_cluster "${id}")"
@@ -52,6 +53,16 @@ for id in $(cell_ids); do
     --set image.repository="${EKS_ADDON_REGISTRY_ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/eks/aws-efa-k8s-device-plugin" \
     --wait --timeout 5m
   ok "aws-efa-k8s-device-plugin"
+
+  # NVIDIA device plugin (nvidia.com/gpu) ----------------------------------------
+  # A DaemonSet with no pods until a GPU inference node joins, so --wait
+  # returns at once on clusters without GPU nodes.
+  hc "${CTX}" upgrade --install nvidia-device-plugin nvdp/nvidia-device-plugin \
+    --version "${NVIDIA_DEVICE_PLUGIN_CHART_VERSION}" \
+    --namespace kube-system \
+    --values "${REPO_ROOT}/platform/nvidia-device-plugin/values.yaml" \
+    --wait --timeout 5m
+  ok "nvidia-device-plugin ${NVIDIA_DEVICE_PLUGIN_CHART_VERSION}"
 
   # Dynamo platform ------------------------------------------------------------
   hc "${CTX}" upgrade --install dynamo-platform \

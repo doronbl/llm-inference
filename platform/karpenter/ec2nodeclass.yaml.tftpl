@@ -1,12 +1,17 @@
 # Inference EC2NodeClass, one per cell. Rendered with templatefile() by
 # infra/modules/cell and applied by scripts/41-platform-cells.sh.
-#   - EKS-optimized AL2023 AMI: same release as the system node groups
+#   - EKS-optimized AL2023 AMI: same release as the system node groups (the
+#     NVIDIA variant for GPU instance types)
 #   - the cell's single private subnet (AZ-pinned)
 #   - node security group + self-referencing EFA security group
 #   - cluster placement group of the cell
 #   - EFA-only secondary interfaces (omitted when efa_enabled = false)
-#   - SOCI lazy loading (platform/soci/) through MIME user data, merged by
-#     nodeadm with the NodeConfig Karpenter generates
+#   - instance-store NVMe combined into one RAID0 array for the kubelet,
+#     containerd and pod ephemeral storage (only for instance types with
+#     local storage)
+#   - SOCI snapshotter (platform/soci/) through MIME user data, merged by
+#     nodeadm with the NodeConfig Karpenter generates: parallel pull, or lazy
+#     loading when the cell's soci_pull_mode is "lazy"
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
@@ -28,6 +33,9 @@ spec:
 %{ endif ~}
   kubelet:
     maxPods: 110
+%{ if instance_store_raid0 ~}
+  instanceStorePolicy: RAID0
+%{ endif ~}
   metadataOptions:
     httpEndpoint: enabled
     httpTokens: required

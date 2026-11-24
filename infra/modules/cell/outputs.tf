@@ -28,6 +28,21 @@ output "inference_instance_type" {
   value       = var.inference_instance_type
 }
 
+output "inference_capacity_types" {
+  description = "Karpenter capacity types of the inference NodePool."
+  value       = var.inference_capacity_types
+}
+
+output "soci_pull_mode" {
+  description = "SOCI snapshotter mode on inference nodes (parallel or lazy)."
+  value       = var.soci_pull_mode
+}
+
+output "instance_store_raid0" {
+  description = "Whether inference nodes combine their instance-store NVMe volumes into one RAID0 array (instance types with local storage)."
+  value       = local.instance_store_raid0
+}
+
 output "efa_interface_count" {
   description = "Number of EFA-only interfaces per inference node."
   value       = local.efa_interface_count

@@ -34,6 +34,30 @@ variable "efa_enabled" {
   default     = true
 }
 
+variable "inference_capacity_types" {
+  description = "Karpenter capacity types of the inference NodePool: \"on-demand\", \"spot\" or both (Karpenter prefers Spot when both are allowed)."
+  type        = list(string)
+  default     = ["on-demand"]
+
+  validation {
+    condition = length(var.inference_capacity_types) > 0 && alltrue([
+      for t in var.inference_capacity_types : contains(["on-demand", "spot"], t)
+    ])
+    error_message = "inference_capacity_types must be a non-empty list of \"on-demand\" and/or \"spot\"."
+  }
+}
+
+variable "soci_pull_mode" {
+  description = "SOCI snapshotter mode on inference nodes: \"parallel\" (parallel pull and unpack of every image, the AMI default) or \"lazy\" (lazy loading of images that have a SOCI index; platform/soci/lazy-loading.sh)."
+  type        = string
+  default     = "parallel"
+
+  validation {
+    condition     = contains(["parallel", "lazy"], var.soci_pull_mode)
+    error_message = "soci_pull_mode must be \"parallel\" or \"lazy\"."
+  }
+}
+
 variable "inference_cpu_limit" {
   description = "Upper bound of inference vCPUs per cell (NodePool limit); 960 = 5 x c8i.48xlarge."
   type        = number

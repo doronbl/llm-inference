@@ -1,6 +1,6 @@
-# Cell-based LLM inference on Amazon EKS: stub milestone
+# Cell-based LLM inference on Amazon EKS
 
-An HTTPS API on one hostname that implements the OpenAI Responses API (`POST /v1/responses`), served by a cell-based platform on Amazon EKS. This repository implements **Phase 1: the stub milestone**. Each cell runs NVIDIA Dynamo (frontend + KV Router) with the Dynamo **mocker** as a fake engine on CPU instances. The design and the Definition of Done (DoD) are in [`docs/architecture.md`](docs/architecture.md).
+An HTTPS API on one hostname that implements the OpenAI Responses API (`POST /v1/responses`), served by a cell-based platform on Amazon EKS. This repository implements **Phase 2: vLLM on GPUs** in one cell. The cell runs the NVIDIA Dynamo frontend (round-robin router) and **eight vLLM workers** serving `Qwen/Qwen3-30B-A3B` on one `p5en.48xlarge` **Spot** instance (8 x H200): one worker per GPU, the instance-store NVMe as one RAID0, SOCI parallel image pull, the model downloaded from Hugging Face. The Phase 1 stub (Dynamo **mocker** on CPU instances) is still available with `ENGINE=stub`. The design and the Definition of Done (DoD) are in [`docs/architecture.md`](docs/architecture.md).
 
 ```
 client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM TLS, Cognito JWT check)
@@ -9,13 +9,14 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
                                     regional router cluster (EKS): router pods
                                     cell = sha256(session-id) mod N_cells
                                                    │ internal NLB per cell
-                                   ┌───────────────┴───────────────┐
-                                   ▼                               ▼
-                       cell a (EKS, AZ 1)                cell b (EKS, AZ 2)
-                       Dynamo frontend + KV Router       Dynamo frontend + KV Router
-                       mocker workers on Karpenter       mocker workers on Karpenter
-                       c8i.48xlarge + EFA                c8i.48xlarge + EFA
+                                                   ▼
+                                       cell a (EKS, AZ 1)
+                                       Dynamo frontend (round-robin router)
+                                       8 vLLM workers (1 GPU each) on Karpenter
+                                       p5en.48xlarge Spot + EFA, NVMe RAID0
 ```
+
+More cells are more entries in `cells` (`infra/envs/region/terraform.tfvars`); the router spreads sessions over them.
 
 ## Repository layout
 
@@ -28,10 +29,11 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
 | `infra/modules/regional` | Regional router cluster (on `eks-base`), ECR repositories (`router`, `dynamo-planner`), Load Balancer Controller IAM (Pod Identity) |
 | `infra/modules/cell` | One cell: cluster in one AZ (on `eks-base`), Karpenter IAM/SQS (Pod Identity), placement group, EFA security group, and the rendered inference EC2NodeClass + NodePool |
 | `infra/envs/region` | One Region environment that lists the cells (`terraform.tfvars.example`) |
-| `platform/` | Helm values and templates: Load Balancer Controller, Karpenter (EC2NodeClass + inference NodePool templates, rendered by Terraform), EFA device plugin, Dynamo, SOCI node config for inference nodes |
+| `platform/` | Helm values and templates: Load Balancer Controller, Karpenter (EC2NodeClass + inference NodePool templates, rendered by Terraform), EFA device plugin, NVIDIA device plugin, Dynamo, SOCI node config for inference nodes |
 | `router/` | Regional router (FastAPI + uvicorn + httpx), tests, Dockerfile, Kubernetes manifests |
-| `workloads/stub-engine` | `DynamoGraphDeployment` (frontend + mocker) and the internal NLB Service |
-| `workloads/vllm` | Placeholder for Phase 2 |
+| `workloads/vllm` | `DynamoGraphDeployment`: frontend (round-robin) + 8 vLLM workers (default engine, `ENGINE=vllm`) |
+| `workloads/stub-engine` | `DynamoGraphDeployment`: frontend (KV Router) + mocker (Phase 1, `ENGINE=stub`) |
+| `workloads/common` | Namespace and the internal NLB Service in front of the frontend (both engines) |
 | `scripts/` | Manual, numbered deploy steps, verification and teardown |
 
 ## Prerequisites
@@ -39,12 +41,12 @@ client ──HTTPS──► Route 53 (latency record) ──► public ALB (ACM 
 ### AWS account
 
 - A **public Route 53 hosted zone** for the domain that holds the API hostname (for example zone `example.com`, hostname `api.example.com`).
-- **On-demand vCPU quota** for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" of at least about **450 vCPUs** in the Region. Each inference node is a `c8i.48xlarge` with 192 vCPUs, one per cell. The system nodes add about 40 vCPUs.
-- `c8i.48xlarge` offered in both cell AZs. Terraform checks this and fails the plan if it is not.
-- **On-demand capacity** for the inference instance type in both cell AZs. Being offered is not the same as having capacity: when an AZ has none, Karpenter's launches fail with `InsufficientInstanceCapacity` and the mocker pods stay `Pending`. Check capacity before you choose the cell AZs. `c7i.48xlarge` has the same vCPU count and EFA layout (one EFA-only interface) and can replace `c8i.48xlarge` without code changes. AZ names map to different AZ IDs in each account; `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` shows the mapping.
+- **Spot vCPU quota** for "All P Spot Instance Requests" of at least **192 vCPUs** (one `p5en.48xlarge`) in the Region, and **on-demand vCPU quota** for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" of about **60 vCPUs** for the system nodes. With `inference_capacity_types = ["spot", "on-demand"]`, also on-demand "Running On-Demand P instances" quota of 192 vCPUs. For the Phase 1 stub cells (`c8i.48xlarge`, 192 vCPUs each, on demand), add 192 standard vCPUs per cell.
+- The inference instance type offered in every cell AZ. Terraform checks this and fails the plan if it is not.
+- **Capacity** for the inference instance type in the cell AZ. Being offered is not the same as having capacity, and `p5en.48xlarge` Spot capacity is scarce: when an AZ has none, Karpenter's launches fail (`InsufficientInstanceCapacity`, or no Spot capacity) and the worker pods stay `Pending` while Karpenter keeps retrying. Check capacity before you choose the cell AZ (for example with `aws ec2 get-spot-placement-scores`), or allow on-demand as a fallback. The inference nodes also run in a cluster placement group, which narrows the capacity Karpenter can use. AZ names map to different AZ IDs in each account; `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` shows the mapping.
 - Permissions to create VPC, EKS, EC2, ELB, IAM, Cognito, ACM, Route 53, ECR, SQS, EventBridge and SSM resources.
 
-> **Cost:** each `c8i.48xlarge` costs about $8–9 per hour on demand, so two cells cost about $17 per hour while inference nodes run. On top of that you pay for three EKS control planes, NAT gateways, the load balancers and the system nodes. Run `scripts/90-teardown.sh` when you are done.
+> **Cost:** a `p5en.48xlarge` is one of the most expensive EC2 instances, even on Spot; check the current Spot price for your Region and AZ before you deploy. Every new inference node also downloads the model eight times (about 460 GB) from Hugging Face through the NAT gateway, which adds NAT data-processing charges. On top of that you pay for two EKS control planes (router and one cell), NAT gateways, the load balancers and the system nodes. Run `scripts/90-teardown.sh` when you are done. (Phase 1 stub cells: each `c8i.48xlarge` costs about $8–9 per hour on demand.)
 
 ### Operator host
 
@@ -138,13 +140,15 @@ cd infra/envs/region
 cp terraform.tfvars.example terraform.tfvars   # git-ignored
 ```
 
-Set `region`, `hosted_zone_name`, `api_hostname`, the two `cells` (each in a different AZ), and `operator_principal_arns`. The repository contains no environment values. Defaults that you normally keep:
+Set `region`, `hosted_zone_name`, `api_hostname`, the `cells` (each in a different AZ; the example has one `p5en.48xlarge` Spot cell), `extra_azs` when there is only one cell (the EKS control planes and the ALB need two AZs), and `operator_principal_arns`. The repository contains no environment values. Defaults that you normally keep:
 
 | Variable | Default |
 |---|---|
 | `vpc_cidr` | `10.0.0.0/16` |
-| `cells.*.inference_instance_type` | `c8i.48xlarge` |
+| `cells.*.inference_instance_type` | `c8i.48xlarge` (the example sets `p5en.48xlarge`) |
 | `cells.*.efa_enabled` | `true` |
+| `cells.*.inference_capacity_types` | `["on-demand"]` (the example sets `["spot"]`; `["spot", "on-demand"]` lets Karpenter fall back to on-demand) |
+| `cells.*.soci_pull_mode` | `parallel` (SOCI parallel pull and unpack); `lazy` turns on lazy loading of images that have a SOCI index (`platform/soci/lazy-loading.sh`). The Phase 1 stub needs `lazy` (its DoD 3); a Phase 1 `terraform.tfvars` without this key switches to parallel pull and replaces the inference nodes on the next apply |
 | `kubernetes_version` | `1.37` |
 
 Choose the cell AZs before the first `terraform apply`. The network module numbers the subnet CIDRs by the position of each AZ in the sorted AZ list, so moving a cell to another AZ later replaces subnets that the other clusters also use. To move a cell, tear the environment down and deploy it again.
@@ -161,8 +165,8 @@ Run the steps from the repository root. Each step can be re-run. All script outp
 | 2 | `OPERATOR_INSTANCE_ID=i-… scripts/20-tunnels.sh start` | Opens SSM tunnels and writes `.state/region/kubeconfig` with one context per cluster |
 | 3 | `scripts/30-images.sh` | Builds and pushes the router image with Docker (git-SHA tag). Mirrors `dynamo-planner:1.6.1` from NGC, converts it to a SOCI-enabled image (index manifest v2) and pushes it to ECR |
 | 4 | `scripts/40-platform-router.sh` | AWS Load Balancer Controller on the router cluster |
-| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter, `kubectl apply` of the EC2NodeClass and NodePool that Terraform rendered, EFA device plugin, Dynamo platform (operator only) |
-| 6 | `scripts/50-stub-engine.sh` | Per cell: the `DynamoGraphDeployment` (frontend + KV Router + mocker) and the internal NLB. Karpenter launches the inference node (about 10 min) |
+| 5 | `scripts/41-platform-cells.sh` | Per cell: Load Balancer Controller, Karpenter, `kubectl apply` of the EC2NodeClass and NodePool that Terraform rendered, EFA device plugin, NVIDIA device plugin, Dynamo platform (operator only) |
+| 6 | `scripts/50-engine.sh` | Per cell: the engine's `DynamoGraphDeployment` and the internal NLB. `ENGINE=vllm` (default): frontend (round-robin) + 8 vLLM workers; Karpenter launches the `p5en.48xlarge` Spot node, and the workers pull the image and download the model (about 15–30 min). `ENGINE=stub`: frontend (KV Router) + mocker on a CPU node (about 10 min) |
 | 7 | `scripts/60-router.sh` | Router ConfigMaps (cell list = internal NLB URLs), Deployment and TargetGroupBinding. Waits for healthy ALB targets |
 | 8 | `scripts/70-verify.sh` | Runs every DoD check below |
 | – | `scripts/20-tunnels.sh stop` | Closes the tunnels |
@@ -183,13 +187,14 @@ tail -f .state/region/deploy.status
 - Each attempt of each step writes `.state/region/logs/<UTC time>-<step>.log`, and `.state/region/deploy.status` gets one timestamped line per attempt and result.
 - A failed step is retried `STEP_RETRIES` more times (default 2) after the tunnels are re-opened. `scripts/10-terraform-apply.sh` is not retried.
 - The runner stops at the first step that still fails. Fix the cause and resume with `--from <step>`.
-- `STUB_ENGINE_TIMEOUT` (default `45m`) sets how long step 6 waits for each cell. Karpenter keeps retrying launches in the background, so a retry of step 6 picks up nodes that arrive late.
+- `ENGINE_TIMEOUT` (default `45m`; the older `STUB_ENGINE_TIMEOUT` still works) sets how long step 6 waits for each cell. Karpenter keeps retrying launches in the background, so a retry of step 6 picks up nodes that arrive late.
+- `ENGINE` (`vllm` or `stub`) selects the engine. Step 6 records it in `.state/region/engine`, and every later script without `ENGINE` in the environment (step 6 again, step 8, the teardown) uses the recorded engine; the default before the first step 6 is `vllm`. Set `ENGINE` explicitly to switch engines; step 6 then deletes the other engine. `ENGINE=vllm` refuses cells whose inference instance type has no GPUs. `ENGINE` applies to every cell.
 
 To use kubectl yourself, run `export KUBECONFIG=$PWD/.state/region/kubeconfig`. The contexts are named after the clusters: `llm-<region>-router`, `llm-<region>-a` and `llm-<region>-b`.
 
 ## Verify the Definition of Done
 
-`scripts/70-verify.sh` runs all nine checks and exits non-zero if any fails. To run them by hand, set up the shell first:
+`scripts/70-verify.sh` runs all the checks below and exits non-zero if any fails. To run them by hand, set up the shell first:
 
 ```bash
 export KUBECONFIG=$PWD/.state/region/kubeconfig
@@ -203,7 +208,7 @@ TOKEN=$(curl -s \
   -d scope=$($TF output -json deploy | jq -r .cognito.required_scope) \
   "$($TF output -json deploy | jq -r .cognito.token_endpoint)" | jq -r .access_token)
 
-MODEL=$(curl -s $API/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id')   # Qwen/Qwen3-0.6B
+MODEL=$(curl -s $API/models -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].id')   # Qwen/Qwen3-30B-A3B (Qwen/Qwen3-0.6B with ENGINE=stub)
 ```
 
 `eval "$(scripts/api-env.sh)"` sets `API`, `TOKEN` and `MODEL` in one step (keep `HOST` and `KUBECONFIG` from above for checks 2, 3 and 9). Run it again when the token expires after 60 minutes. Use it instead of sourcing `scripts/lib.sh`: that file is for the scripts and turns on strict shell options.
@@ -217,38 +222,41 @@ $TF output -json deploy | jq '.cells | map_values({cluster_name, availability_zo
 
 You should see the VPC, certificate, user pool and app client, ALB, Route 53 record, both ECR repositories, and three EKS clusters (router, `a`, `b`). The two cells must be in different AZs.
 
-### 2. Mocker on Karpenter inference nodes with EFA, behind the Dynamo frontend
+### 2. Workers on the Karpenter inference node: instance type, capacity type, EFA, GPUs, RAID0
 
 ```bash
-for c in a b; do
+for c in $($TF output -json deploy | jq -r '.cells | keys[]'); do
   CTX=$($TF output -json deploy | jq -r ".cells.$c.cluster_name")
   kubectl --context $CTX get nodes -l karpenter.sh/nodepool=inference \
-    -o custom-columns='NODE:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,ZONE:.metadata.labels.topology\.kubernetes\.io/zone,EFA:.status.allocatable.vpc\.amazonaws\.com/efa'
+    -o custom-columns='NODE:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,CAPACITY:.metadata.labels.karpenter\.sh/capacity-type,ZONE:.metadata.labels.topology\.kubernetes\.io/zone,GPU:.status.allocatable.nvidia\.com/gpu,EFA:.status.allocatable.vpc\.amazonaws\.com/efa'
   kubectl --context $CTX -n llm-inference get pods -o wide \
-    -l nvidia.com/dynamo-graph-deployment-name=stub-engine
+    -l nvidia.com/dynamo-graph-deployment-name=vllm-engine
 done
 ```
 
-Each cell shows a node of its configured inference instance type (for example `c8i.48xlarge`) in its own AZ with `EFA` = `1`. The `worker` (mocker) pods run on that node, and the `frontend` pods run on system nodes.
+The cell shows one `p5en.48xlarge` node with `CAPACITY` = `spot`, `GPU` = `8` and `EFA` = `16`. The eight `worker` (vLLM) pods run on that node, and the two `frontend` pods run on system nodes. (With `ENGINE=stub`: a `c8i.48xlarge` with `EFA` = `1` and the `stub-engine` mocker pods.)
 
-### 3. SOCI lazy-loads the mocker image
+GPUs reach Kubernetes through the NVIDIA device plugin (`platform/nvidia-device-plugin/`), which runs only on GPU inference nodes. Karpenter picks the NVIDIA variant of the pinned AL2023 AMI for GPU instance types; it has the driver and the NVIDIA container runtime.
+
+Instance types with local NVMe get `instanceStorePolicy: RAID0` in the EC2NodeClass: nodeadm combines the eight 3.8 TB drives of a `p5en.48xlarge` into one RAID0 array and puts the kubelet, containerd and pod ephemeral storage (including the workers' model `emptyDir`) on it. To see it on the node (through SSM, as in check 3): `cat /proc/mdstat; findmnt --target /var/lib/kubelet`.
+
+### 3. SOCI on the inference nodes
 
 ```bash
 NODE=$(kubectl --context $CTX get nodes -l karpenter.sh/nodepool=inference -o jsonpath='{.items[0].spec.providerID}')
 INSTANCE=${NODE##*/}
 CMD=$(aws ssm send-command --instance-ids $INSTANCE --document-name AWS-RunShellScript \
-  --parameters 'commands=["findmnt --source soci"]' --query Command.CommandId --output text)
+  --parameters 'commands=["grep -A1 parallel_pull_unpack /etc/soci-snapshotter-grpc/config.toml; ctr -n k8s.io snapshots --snapshotter soci ls | head"]' \
+  --query Command.CommandId --output text)
 sleep 5; aws ssm get-command-invocation --command-id $CMD --instance-id $INSTANCE --query StandardOutputContent --output text
 ```
 
-The output lists `fuse.rawBridge` mounts under `/var/lib/soci-snapshotter-grpc/`, one for each lazily loaded layer of `…/dynamo-planner:1.6.1-soci`.
+SOCI runs only on inference nodes. They use the snapshotter that ships in the AL2023 AMI, enabled by the nodeadm `FastImagePull` feature gate (`platform/soci/nodeconfig.yaml`). The cell's `soci_pull_mode` selects how it pulls images:
 
-SOCI runs only on inference nodes. They use the snapshotter that ships in the AL2023 AMI, enabled by the nodeadm `FastImagePull` feature gate (`platform/soci/nodeconfig.yaml`). `platform/soci/lazy-loading.sh` changes two settings of that configuration at boot:
+- **`parallel` (default):** the AMI's own configuration, parallel pull and unpack of every image (no SOCI index needed). The output above shows `enable = true` under `[pull_modes.parallel_pull_unpack]` and the image layers as snapshots of the `soci` snapshotter. The vLLM image (`vllm-runtime`, about 10 GB compressed) is pulled this way straight from NGC.
+- **`lazy`:** `platform/soci/lazy-loading.sh` runs at boot and changes two settings. It turns parallel pull off (in that mode SOCI never lazy-loads), and it switches the snapshotter from the containerd content store to its own (`content_store.type = 'soci'`): with the containerd content store, a lazy mount that runs while containerd unpacks another image can deadlock both daemons on the node's first boot, and every later pull then hangs with pods in `ContainerCreating` ([awslabs/soci-snapshotter#2037](https://github.com/awslabs/soci-snapshotter/issues/2037), still open for the v0.16.1 snapshotter in the AMI). Only images with a SOCI index are lazy-loaded (the `…/dynamo-planner:1.6.1-soci` mirror); check them with `findmnt --source soci`, which lists `fuse.rawBridge` mounts under `/var/lib/soci-snapshotter-grpc/`. If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
 
-- It turns parallel pull off. In that mode SOCI never lazy-loads.
-- It switches the snapshotter from the containerd content store to its own (`content_store.type = 'soci'`). With the containerd content store, a lazy mount that runs while containerd unpacks another image can deadlock both daemons on the node's first boot. Every later pull then hangs and pods stay in `ContainerCreating` ([awslabs/soci-snapshotter#2037](https://github.com/awslabs/soci-snapshotter/issues/2037), still open for the v0.16.1 snapshotter in the AMI).
-
-If the mounts are missing, look for `soci lazy-loading:` in `/var/log/cloud-init-output.log` on the node.
+Changing `soci_pull_mode` changes the EC2NodeClass user data; Karpenter then replaces the inference nodes (drift).
 
 ### 4. Streaming Responses API call returns response events ending with `data: [DONE]`
 
@@ -295,7 +303,7 @@ done | sort | uniq -c
 
 The result is a single line, for example `10 x-served-cell: b`.
 
-### 6. Different `session-id` values spread across both cells
+### 6. Different `session-id` values spread across all cells
 
 ```bash
 for i in $(seq 20); do
@@ -306,7 +314,7 @@ for i in $(seq 20); do
 done | sort | uniq -c
 ```
 
-All requests use the same token (the same client), and both `x-served-cell: a` and `x-served-cell: b` appear.
+All requests use the same token (the same client), and every cell appears (for example both `x-served-cell: a` and `x-served-cell: b`). With a single cell this check passes trivially; `scripts/70-verify.sh` reports it as skipped.
 
 ### 7. The official OpenAI Python SDK
 
@@ -360,12 +368,26 @@ curl -v --connect-timeout 5 http://$HOST/ ; echo "exit $?"                      
 
 The ALB rejects these requests before they reach the cluster. The router checks the token again as defense in depth.
 
+### 10. Requests are spread over all eight vLLM workers (round-robin)
+
+```bash
+for i in $(seq 24); do
+  curl -s $API/responses \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -H "session-id: rr-$i" \
+    -d "{\"model\":\"$MODEL\",\"max_output_tokens\":4,\"input\":\"hi\",\"nvext\":{\"extra_fields\":[\"worker_id\"]}}" \
+    | jq -r '.nvext.worker_id | (.decode_worker_id // .prefill_worker_id)'
+done | sort | uniq -c
+```
+
+The output lists eight different worker IDs. The Dynamo frontend runs `DYN_ROUTER_MODE=round-robin`, so each frontend replica sends each request to the next worker; with two replicas behind the internal NLB the counts are close to even, not exact. (Skipped with `ENGINE=stub`.)
+
 ## Router
 
 | Behavior | Detail |
 |---|---|
 | Endpoints | `POST /v1/responses` (OpenAI Responses API, streaming and non-streaming) and `GET /v1/models`, plus `GET /healthz` for the ALB health check. Other paths return `404` |
 | Conversation state | Stateless. Clients send the conversation so far in `input` on every turn. `previous_response_id` is rejected by the Dynamo frontend (`501`), and stored responses cannot be retrieved |
+| Thinking output | `Qwen/Qwen3-30B-A3B` thinks before it answers, and no reasoning parser is configured, so its `<think>…</think>` text is part of `output_text`. Short `max_output_tokens` (the checks use 4–16) usually return only the start of the thinking |
 | Authentication | The Cognito access token must have a valid RS256 signature, the right `iss`, an unexpired `exp`, `token_use=access`, and the required scope. Signing keys come from PyJWT's `PyJWKClient` (cached). An unreachable JWKS endpoint returns `503` |
 | Cell selection | `int(sha256(session-id)) mod N`, over the cell order in the `router-cells` ConfigMap. Append new cells at the end. Changing the list remaps some sessions, which then start cold in their new cell |
 | Proxying | Raw bytes are passed through as they arrive, so SSE is not buffered. `Authorization` is not forwarded to cells. The router adds `x-served-region` and `x-served-cell` |
@@ -383,7 +405,7 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 
 ## Later phases need configuration changes only
 
-- **Phase 2 (P5 + vLLM):** set `inference_instance_type` of each cell to a P5 type in `terraform.tfvars`. The cell module reads the instance's EFA and network-card limits and outputs the matching EFA-only interface layout for the EC2NodeClass. Then put a vLLM worker in place of the mocker component (`workloads/vllm/`).
+- **Phase 2 (P5 + vLLM), done:** one `p5en.48xlarge` Spot cell with eight vLLM workers (`workloads/vllm/`). Next steps that stay within configuration: KV-cache-aware routing (`DYN_ROUTER_MODE=kv` plus the `--kv-events-config` worker argument, both commented in `workloads/vllm/dynamographdeployment.yaml.tpl`), one model download per node instead of per worker, and loading from S3 or the local RAID0 with the Run:ai Model Streamer (`--load-format runai_streamer`; the streamer is in the `vllm-runtime` image).
 - **Phase 5 (second Region):** copy `infra/envs/region/` to a new directory with its own `terraform.tfvars` and the same `api_hostname`. Its Route 53 record joins the latency-based record set. To run the scripts against it, set `ENV_DIR=infra/envs/<new-dir>`.
 
 ## Pinned versions
@@ -394,7 +416,7 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 | Terraform providers | `hashicorp/aws` 6.72.0 and others | `infra/envs/region/versions.tf`, `infra/envs/region/.terraform.lock.hcl` |
 | Terraform modules | `terraform-aws-modules`: vpc 6.7.3, eks 21.29.0, eks-pod-identity 2.10.0 | the module sources |
 | Kubernetes, EKS add-ons, AL2023 AMI release (system nodes, and Karpenter nodes as `al2023@v<date>`) | 1.37, AMI `1.37.1-20261031` | `infra/envs/region/variables.tf` |
-| Helm charts and images | LBC 3.6.2, Karpenter 1.15.1, EFA plugin v0.5.35, Dynamo 1.6.1, `dynamo-planner` by digest | `scripts/versions.env` |
+| Helm charts and images | LBC 3.6.2, Karpenter 1.15.1, EFA plugin v0.5.35, NVIDIA device plugin 0.20.2, Dynamo 1.6.1, `dynamo-planner` and `vllm-runtime` (vLLM 0.31.0) by digest, model `Qwen/Qwen3-30B-A3B` | `scripts/versions.env` |
 | SOCI snapshotter on inference nodes | the version shipped in the pinned AMI | AMI release above |
 | Router base image | `python:3.13.18-slim-trixie` by digest | `router/Dockerfile` |
 | Router Python dependencies | exact versions | `router/pyproject.toml` |
@@ -404,7 +426,7 @@ The tests cover routing determinism (including independence from `PYTHONHASHSEED
 - **EC2 instance names and tags:** system nodes are named `<cluster>-system` (for example `llm-us-east-1-a-system`) and Karpenter inference nodes `<cluster>-inference`. Every node carries `Project=llm-inference`, `Region`, `llm-inference/cluster`, `llm-inference/role` (`router` or `cell`), `llm-inference/node-class` (`system` or `inference`), and on cell nodes `llm-inference/cell` (`a`, `b`, …). Filter by them in the EC2 console or with `aws ec2 describe-instances --filters Name=tag:llm-inference/cell,Values=a`.
 - **Logs and metrics:** only the default CloudWatch integration is used: EKS control-plane logs plus the EC2, ALB and NLB metrics.
 - **IAM:** in-cluster controllers (Karpenter, Load Balancer Controller) get credentials through EKS Pod Identity associations created by Terraform. The clusters have no OIDC provider.
-- **Downloads at startup:** nodes download nothing at boot. The mocker downloads its tokenizer (`Qwen/Qwen3-0.6B`) from Hugging Face at startup.
-- **Dynamo frontends:** each cell runs two frontend replicas. Each one subscribes to the workers' KV events itself (event plane, ZMQ by default), so both build the same prefix index. `DYN_ROUTER_REPLICA_SYNC=true` also shares active-request load between them.
+- **Downloads at startup:** nodes download nothing at boot. Each vLLM worker downloads `Qwen/Qwen3-30B-A3B` (about 57 GiB) from Hugging Face into its own `emptyDir` on the instance-store RAID0 at startup, so a new node starts eight downloads at once (about 460 GB). Anonymous downloads have lower rate limits and can be throttled, which makes workers restart or exceed the step 6 wait. Creating the secret `hf-token-secret` (key `HF_TOKEN`) before step 6 is **recommended**: `kubectl --context <cell-cluster> create namespace llm-inference; kubectl --context <cell-cluster> -n llm-inference create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>`. The workers read it when it exists. The mocker (`ENGINE=stub`) downloads only its tokenizer (`Qwen/Qwen3-0.6B`).
+- **Dynamo frontends:** each cell runs two frontend replicas. With `ENGINE=vllm` they route round-robin. In KV mode (the stub, or vLLM with `DYN_ROUTER_MODE=kv`) each one subscribes to the workers' KV events itself (event plane, ZMQ by default), so both build the same prefix index, and `DYN_ROUTER_REPLICA_SYNC=true` also shares active-request load between them. vLLM workers publish KV events only with `--kv-events-config`.
 - **No NATS or etcd:** Dynamo 1.6.1 discovers workers through the Kubernetes API, sends requests over TCP and KV events over ZMQ, so the platform chart installs only the operator. NATS would only be needed for `DYN_EVENT_PLANE=nats`, `DYN_REQUEST_PLANE=nats` or a NATS request-trace sink.
 - **EFA device plugin image:** the plugin image comes from the EKS add-on registry of the Region, account `602401143452`. Opt-in Regions use a different account; set `EKS_ADDON_REGISTRY_ACCOUNT` in `scripts/versions.env`.

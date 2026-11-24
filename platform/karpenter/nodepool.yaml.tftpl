@@ -25,7 +25,7 @@ spec:
           values: ["${instance_type}"]
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["on-demand"]
+          values: ${jsonencode(capacity_types)}
         - key: kubernetes.io/os
           operator: In
           values: ["linux"]

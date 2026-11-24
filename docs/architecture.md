@@ -1,6 +1,6 @@
 # Cell-Based LLM Inference Platform on Amazon EKS — Architecture Snapshot
 
-**Status:** v1 (stub phase)
+**Status:** v2 (Phase 2: vLLM on one GPU cell; the Phase 1 stub stays available)
 **Purpose:** Self-learning and experimentation platform for serving open-weight LLMs, built with a production-grade design.
 
 ---
@@ -13,6 +13,7 @@
 - **Pin each session to one cell** so its KV cache is reused.
 - Start in **one AWS Region** (configurable) with multiple cells. Adding Regions later must only require new configuration, not changes to the design.
 - First milestone: a **stub deployment that works end to end** on CPU instances (no GPUs).
+- Second milestone: **real inference** with vLLM on one GPU cell (section 11a).
 
 ---
 
@@ -36,7 +37,7 @@ Regional Router cluster (1 EKS cluster per Region)
 Cell k (1 EKS cluster, 1 AZ), reached through an internal NLB
    │   NVIDIA Dynamo frontend (OpenAI Responses API) + KV Router
    ▼
-Dynamo workers on Karpenter inference nodes (Dynamo mocker in v1, vLLM later)
+Dynamo workers on Karpenter inference nodes (vLLM in v2; Dynamo mocker in v1)
 ```
 
 ### 2.1 Routing hierarchy
@@ -45,7 +46,7 @@ Dynamo workers on Karpenter inference nodes (Dynamo mocker in v1, vLLM later)
 |---|---|---|---|
 | 1. Region | Which Region | Route 53 | Latency-based routing on the single domain |
 | 2. Cell | Which cell in the Region | Regional router cluster | `sha256(session-id) mod N_cells` |
-| 3. Worker | Which worker in the cell | Inside each cell cluster | NVIDIA Dynamo KV Router (KV-cache-aware) |
+| 3. Worker | Which worker in the cell | Inside each cell cluster | NVIDIA Dynamo frontend router: round-robin in v2 (KV-cache-aware KV Router in the v1 stub, and the next step for vLLM) |
 
 ### 2.2 Session pinning (tier 2)
 
@@ -98,8 +99,8 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 - Cells are identical. They are created from one reusable Terraform `cell` module with these inputs: `region`, `availability_zone`, `cell_id`, `inference_instance_type`, `efa_enabled`.
 - Each cell contains:
   - **System node group:** EKS managed node group, latest-generation x86 `c` instances, EKS-optimized AL2023 AMI. Runs cluster add-ons, Karpenter, AWS Load Balancer Controller, and the Dynamo platform (operator, frontend, KV Router). Dynamo uses its defaults: Kubernetes-native worker discovery, TCP request plane, and ZMQ event plane for KV events. No etcd and no NATS. Frontend replicas run with router replica sync enabled.
-  - **Karpenter inference nodes:** a Karpenter NodePool pinned to the cell's AZ, EKS-optimized AL2023 AMI, running all inference workers. Instance type is a parameter: `c8i.48xlarge` (CPU, EFA-capable) in v1, or `c7i.48xlarge` (same vCPU count and EFA layout) where `c8i.48xlarge` has no on-demand capacity in the cell's AZ; P5 family later. The inference EC2NodeClass and NodePool are rendered by the Terraform `cell` module. They use the same pinned AMI release as the system node groups (as the Karpenter alias `al2023@v<date>`).
-  - **Inference workers:** aggregated serving, with prefill and decode in the same worker (Dynamo component type `worker`).
+  - **Karpenter inference nodes:** a Karpenter NodePool pinned to the cell's AZ, EKS-optimized AL2023 AMI, running all inference workers. Instance type and capacity type (on-demand, Spot or both) are parameters: `p5en.48xlarge` Spot (8 x H200, EFA, 8 x 3.8 TB instance-store NVMe) in v2; `c8i.48xlarge` on demand (CPU, EFA-capable) in v1, or `c7i.48xlarge` (same vCPU count and EFA layout) where `c8i.48xlarge` has no on-demand capacity in the cell's AZ. Instance types with local NVMe combine it into one RAID0 array for the kubelet, containerd and pod ephemeral storage (Karpenter `instanceStorePolicy: RAID0`). For GPU instance types Karpenter selects the NVIDIA variant of the AMI, and the NVIDIA device plugin advertises the GPUs as `nvidia.com/gpu`. The inference EC2NodeClass and NodePool are rendered by the Terraform `cell` module. They use the same pinned AMI release as the system node groups (as the Karpenter alias `al2023@v<date>`).
+  - **Inference workers:** aggregated serving, with prefill and decode in the same worker (Dynamo component type `worker`). In v2: eight vLLM workers (`python3 -m dynamo.vllm`), one GPU each, on one `p5en.48xlarge`.
 
 ---
 
@@ -150,18 +151,19 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 | Regional router | Small stateless Python service (FastAPI + uvicorn, httpx for streaming proxy, PyJWT for JWT verification) |
 | Cell orchestration and worker routing | NVIDIA Dynamo 1.6.1 (operator, frontend, KV Router; Kubernetes discovery, TCP request plane, ZMQ event plane; no etcd, no NATS), installed with the Dynamo Helm charts |
 | Stub engine (v1) | Dynamo mocker engine, deployed as a `DynamoGraphDeployment`; tokenizer `Qwen/Qwen3-0.6B` fetched from Hugging Face at startup |
-| Inference engine (later) | vLLM, as a Dynamo worker |
+| Inference engine (v2) | vLLM 0.31.0 as a Dynamo worker (`nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.6.1`, pinned by digest), model `Qwen/Qwen3-30B-A3B` (MoE, about 57 GiB in BF16), eight workers with one H200 each |
+| GPU enablement | NVIDIA variant of the EKS AL2023 AMI (driver, container runtime) + NVIDIA Kubernetes device plugin (`nvidia.com/gpu`) |
 | Kubernetes | Amazon EKS (private endpoints): one regional router cluster per Region, one cluster per cell |
 | EKS node OS | EKS-optimized Amazon Linux 2023 AMIs |
 | Non-EKS EC2 instances | Ubuntu Server 26.04 LTS |
 | Node provisioning | Karpenter (AZ-pinned inference NodePool), EKS managed node group for system nodes |
 | Controller IAM | EKS Pod Identity |
-| Inference instances | Parameterized: `c8i.48xlarge` with EFA in v1 (`c7i.48xlarge` where c8i capacity is unavailable), P5 family later |
+| Inference instances | Parameterized: `p5en.48xlarge` Spot with EFA and instance-store RAID0 in v2; `c8i.48xlarge` on demand with EFA in v1 (`c7i.48xlarge` where c8i capacity is unavailable) |
 | RDMA | EFA (EFA-only secondary interfaces) + EFA Kubernetes device plugin |
 | Pod networking | Amazon VPC CNI with prefix delegation |
-| Model storage | Amazon S3 (source of truth) — used from Phase 2 |
-| Model loading | Run:ai Model Streamer (from S3) — used from Phase 2 |
-| Container image loading | SOCI snapshotter on Karpenter inference nodes only (enabled in Phase 1): the AL2023 AMI's built-in snapshotter, enabled with the nodeadm `FastImagePull` feature gate and switched from parallel pull to lazy loading, using the snapshotter's own (SOCI) content store. A SOCI index is built on the operator host with the `soci` CLI only for the `dynamo-planner` mirror |
+| Model storage | v2: Hugging Face, downloaded by every worker into its own `emptyDir` on the node's instance-store RAID0. Later: Amazon S3 as the source of truth |
+| Model loading | v2: vLLM's default loader from the local copy. Later: Run:ai Model Streamer (from the local RAID0 or S3; included in the `vllm-runtime` image) |
+| Container image loading | SOCI snapshotter on Karpenter inference nodes only: the AL2023 AMI's built-in snapshotter, enabled with the nodeadm `FastImagePull` feature gate. Per-cell mode `soci_pull_mode`: `parallel` (v2 default; parallel pull and unpack of every image, no SOCI index needed) or `lazy` (v1; parallel pull off, lazy loading of images with a SOCI index, using the snapshotter's own (SOCI) content store). A SOCI index is built on the operator host with the `soci` CLI only for the `dynamo-planner` mirror |
 | Container registry | Amazon ECR: `router` repo (plain image) and a `dynamo-planner` mirror repo (with SOCI index) |
 | Infrastructure as code | Terraform, local state |
 | Logs and metrics | Amazon CloudWatch (default EKS/EC2/ALB/NLB integration only) |
@@ -198,8 +200,9 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 │   ├── aws-load-balancer-controller/
 │   ├── karpenter/                 # Helm values + EC2NodeClass (AL2023, SOCI, EFA) and inference NodePool templates
 │   ├── efa-device-plugin/
+│   ├── nvidia-device-plugin/      # nvidia.com/gpu on GPU inference nodes
 │   ├── dynamo/
-│   └── soci/                      # nodeadm FastImagePull config + lazy-loading switch (inference nodes)
+│   └── soci/                      # nodeadm FastImagePull config + optional lazy-loading switch (inference nodes)
 ├── router/                        # regional router service (Python)
 │   ├── app/
 │   ├── tests/
@@ -207,8 +210,9 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 │   ├── Dockerfile
 │   └── deploy/                    # Kubernetes manifests incl. TargetGroupBinding
 ├── workloads/
-│   ├── stub-engine/               # DynamoGraphDeployment for the Dynamo mocker + internal NLB Service
-│   └── vllm/                      # real engine deployment (post-stub)
+│   ├── common/                    # namespace + internal NLB Service in front of the frontend
+│   ├── stub-engine/               # DynamoGraphDeployment for the Dynamo mocker (Phase 1)
+│   └── vllm/                      # DynamoGraphDeployment for 8 vLLM workers (Phase 2)
 └── scripts/                       # manual deploy scripts: image build/mirror + SOCI index, add-ons, workloads, verification, teardown
 ```
 
@@ -228,12 +232,25 @@ All clusters share one set of EKS settings (a thin Terraform `eks-base` wrapper 
 
 ---
 
+## 11a. Phase 2 (vLLM on one GPU cell): Definition of Done
+
+1. `terraform apply` creates the same Region resources as in section 11 with **one cell** (plus `extra_azs`, because the EKS control planes and the ALB need two AZs). The router cluster is unchanged.
+2. The cell's Karpenter NodePool launches one **`p5en.48xlarge` Spot** instance. It has all 8 GPUs allocatable as `nvidia.com/gpu` (NVIDIA device plugin), its EFA-only interfaces visible as `vpc.amazonaws.com/efa`, and its instance-store NVMe combined into one RAID0 array that holds the kubelet and containerd storage.
+3. SOCI runs in **parallel pull** mode on the inference node.
+4. **Eight vLLM workers** (`Qwen/Qwen3-30B-A3B`, one GPU each) run on that node behind the Dynamo frontend. Each worker downloads the model from Hugging Face into its own `emptyDir` on the RAID0.
+5. Checks 4–9 of section 11 pass against the vLLM engine (check 6 is trivial with one cell).
+6. Requests through the single public endpoint are spread **round-robin** over all eight workers (Dynamo `nvext.worker_id`).
+
+`scripts/70-verify.sh` checks all of them.
+
+---
+
 ## 12. Build Phases
 
 | Phase | Scope |
 |---|---|
 | 1 | Stub milestone (section 11), including a teardown script |
-| 2 | Switch the inference NodePool to a P5 instance and replace the mocker with vLLM, using a small dense open-weight model (~8B) loaded from S3 with Run:ai Model Streamer (no Hugging Face fetch at runtime) |
+| 2 | Switch the inference NodePool to a P5 instance and replace the mocker with vLLM (section 11a, done): one `p5en.48xlarge` Spot cell, `Qwen/Qwen3-30B-A3B` downloaded from Hugging Face, round-robin routing. Next: KV-aware routing, one download per node, and loading from S3 or the local RAID0 with Run:ai Model Streamer |
 | 3 | Measure baseline TTFT, TPOT and cold-start time for each cell |
 | 4 | Larger or MoE open-weight model |
 | 5 | Add a second Region (copy `infra/envs/region/` to a new env directory + Route 53 latency record) |

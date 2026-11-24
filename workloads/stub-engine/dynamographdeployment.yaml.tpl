@@ -1,6 +1,7 @@
 # Stub engine for Phase 1: Dynamo frontend (OpenAI API + KV Router) and Dynamo
 # mocker workers, aggregated serving (prefill and decode in the same worker).
-# Rendered per cell by scripts/50-stub-engine.sh (envsubst: DYNAMO_IMAGE).
+# Rendered per cell by scripts/50-engine.sh with ENGINE=stub (envsubst:
+# DYNAMO_IMAGE).
 #
 # DYNAMO_IMAGE is the ECR mirror of nvcr.io/nvidia/ai-dynamo/dynamo-planner
 # with a SOCI index (the mocker ships in the planner image).

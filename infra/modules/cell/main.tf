@@ -45,7 +45,13 @@ locals {
   ) : []
 
   # Same AMI release as the system node groups: "1.37.1-20261031" -> "al2023@v20261031".
+  # For GPU instance types Karpenter resolves the alias to the NVIDIA variant of the AMI.
   ami_alias = "al2023@v${split("-", var.ami_release_version)[1]}"
+
+  # Instance types with local NVMe (for example p5en.48xlarge, 8 x 3.8 TB) get
+  # instanceStorePolicy RAID0: nodeadm combines the drives into one RAID0
+  # array and puts the kubelet, containerd and pod ephemeral storage on it.
+  instance_store_raid0 = data.aws_ec2_instance_type.inference.instance_storage_supported
 }
 
 ################################################################################
@@ -198,7 +204,8 @@ module "lbc_pod_identity" {
 ################################################################################
 
 # SOCI on inference nodes only: the AMI's built-in snapshotter, enabled through
-# nodeadm, plus the switch from parallel pull to lazy loading.
+# nodeadm. Its default configuration is parallel pull and unpack
+# (soci_pull_mode = "parallel"); "lazy" adds the switch to lazy loading.
 data "cloudinit_config" "inference" {
   gzip          = false
   base64_encode = false
@@ -209,9 +216,12 @@ data "cloudinit_config" "inference" {
     content      = file("${var.platform_dir}/soci/nodeconfig.yaml")
   }
 
-  part {
-    content_type = "text/x-shellscript; charset=\"us-ascii\""
-    content      = file("${var.platform_dir}/soci/lazy-loading.sh")
+  dynamic "part" {
+    for_each = var.soci_pull_mode == "lazy" ? [file("${var.platform_dir}/soci/lazy-loading.sh")] : []
+    content {
+      content_type = "text/x-shellscript; charset=\"us-ascii\""
+      content      = part.value
+    }
   }
 }
 
@@ -224,6 +234,7 @@ locals {
       security_group_ids   = [module.cluster.node_security_group_id, aws_security_group.efa.id]
       placement_group_name = aws_placement_group.inference.name
       network_interfaces   = local.inference_network_interfaces
+      instance_store_raid0 = local.instance_store_raid0
       user_data            = data.cloudinit_config.inference.rendered
       # Karpenter launches these instances, so provider default tags do not
       # reach them; set the project tags and a cluster-specific Name here.
@@ -240,6 +251,7 @@ locals {
       cell_id           = var.cell_id
       availability_zone = var.availability_zone
       instance_type     = var.inference_instance_type
+      capacity_types    = var.inference_capacity_types
       cpu_limit         = var.inference_cpu_limit
     }),
   ])

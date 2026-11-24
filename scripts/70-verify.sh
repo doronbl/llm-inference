@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Step 8: check every Definition of Done item (docs/architecture.md, section 11).
+# Step 8: check every Definition of Done item (docs/architecture.md, sections
+# 11 and 11a; ENGINE selects the engine, default vllm).
 # Requires the tunnels from scripts/20-tunnels.sh (for DoD 2 and 3) and the
 # openai package for DoD 7 (pip install openai==3.46.0). Set VERIFY_PYTHON to
 # a Python that has it, for example a venv: VERIFY_PYTHON=~/.venvs/llm-verify/bin/python.
@@ -14,7 +15,7 @@ check() { if "$@"; then :; else failures=$((failures + 1)); fi; }
 
 ################################################################################
 dod1() {
-  log "DoD 1: terraform created VPC, ACM, Cognito, ALB, Route 53, ECR, router cluster and two cells"
+  log "DoD 1: terraform created VPC, ACM, Cognito, ALB, Route 53, ECR, router cluster and the cells"
   local state ok_all=0
   state="$(terraform -chdir="${ENV_DIR}" state list)"
   for addr in \
@@ -33,63 +34,110 @@ dod1() {
   clusters="$(grep -c 'module.eks.aws_eks_cluster.this\[0\]$' <<<"${state}")"
   want=$(($(tf_deploy '.cells | length') + 1))
   if [[ "${clusters}" -eq "${want}" ]]; then ok "${clusters} EKS clusters (router + cells)"; else fail "${clusters} EKS clusters, want ${want}"; ok_all=1; fi
-  local azs
+  local azs n_cells
   azs="$(tf_deploy '[.cells[].availability_zone] | unique | length')"
-  if [[ "$(tf_deploy '.cells | length')" -ge 2 && "${azs}" -ge 2 ]]; then
-    ok "$(tf_deploy '.cells | length') cells in ${azs} AZs: $(tf_deploy '[.cells[] | "\(.cluster_name)@\(.availability_zone)"] | join(", ")')"
+  n_cells="$(tf_deploy '.cells | length')"
+  if [[ "${n_cells}" -ge 1 && "${azs}" -eq "${n_cells}" ]]; then
+    ok "${n_cells} cell(s) in ${azs} AZ(s): $(tf_deploy '[.cells[] | "\(.cluster_name)@\(.availability_zone)"] | join(", ")')"
   else
-    fail "need two cells in two different AZs"; ok_all=1
+    fail "need at least one cell, each in its own AZ"; ok_all=1
   fi
   return "${ok_all}"
 }
 
 ################################################################################
+# Runs one shell command on an instance through SSM and prints its stdout.
+node_cmd() {
+  local instance="$1" comment="$2" command="$3" cmd
+  cmd="$(aws ssm send-command --region "${REGION}" --instance-ids "${instance}" \
+    --document-name AWS-RunShellScript --comment "${comment}" \
+    --parameters "$(jq -nc --arg c "${command}" '{commands: [$c]}')" --query Command.CommandId --output text)"
+  aws ssm wait command-executed --region "${REGION}" --command-id "${cmd}" --instance-id "${instance}" 2>/dev/null || true
+  aws ssm get-command-invocation --region "${REGION}" --command-id "${cmd}" --instance-id "${instance}" \
+    --query StandardOutputContent --output text
+}
+
 dod2_3() {
-  log "DoD 2: mocker on Karpenter inference nodes with EFA, behind the Dynamo frontend"
-  log "DoD 3: SOCI lazy-loads the mocker image (findmnt --source soci via SSM)"
+  log "DoD 2: ${ENGINE} workers on Karpenter inference nodes (instance type, capacity type, EFA, GPUs, RAID0), behind the Dynamo frontend"
+  log "DoD 3: SOCI on the inference nodes (parallel pull or lazy loading, per cell), checked through SSM"
   local rc=0
   for id in $(cell_ids); do
-    local ctx expected_type efa_expected nodes
+    local ctx expected_type efa_expected capacity_types soci_mode raid0 want_workers running nodes
     ctx="$(cell_cluster "${id}")"
     expected_type="$(cell_value "${id}" inference_instance_type)"
     efa_expected="$(cell_value "${id}" efa_interface_count)"
+    capacity_types="$(tf_deploy ".cells[\"${id}\"].inference_capacity_types | join(\" \")")"
+    soci_mode="$(cell_value "${id}" soci_pull_mode)"
+    raid0="$(cell_value "${id}" instance_store_raid0)"
 
-    nodes="$(kc "${ctx}" get pods -n llm-inference \
-      -l nvidia.com/dynamo-graph-deployment-name=stub-engine,nvidia.com/dynamo-component-type=worker \
-      --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u)"
-    if [[ -z "${nodes}" ]]; then fail "cell ${id}: no running mocker pods"; rc=1; continue; fi
+    want_workers="$(kc "${ctx}" -n llm-inference get dynamographdeployment "${ENGINE_DGD}" -o json \
+      | jq -r '[.spec.components[] | select(.type == "worker") | .replicas] | add // 0')"
+    running="$(kc "${ctx}" get pods -n llm-inference \
+      -l "nvidia.com/dynamo-graph-deployment-name=${ENGINE_DGD},nvidia.com/dynamo-component-type=worker" \
+      --field-selector=status.phase=Running -o json)"
+    nodes="$(jq -r '[.items[].spec.nodeName] | unique | .[]' <<<"${running}")"
+    if [[ "$(jq '.items | length' <<<"${running}")" -eq "${want_workers}" && "${want_workers}" -ge 1 ]]; then
+      ok "cell ${id}: ${want_workers}/${want_workers} ${ENGINE} workers running"
+    else
+      fail "cell ${id}: $(jq '.items | length' <<<"${running}")/${want_workers} ${ENGINE} workers running"; rc=1
+    fi
+    [[ -n "${nodes}" ]] || { rc=1; continue; }
 
     for node in ${nodes}; do
-      local info type nodepool efa provider instance
+      local info type nodepool capacity efa gpus gpu_count provider instance out
       info="$(kc "${ctx}" get node "${node}" -o json)"
       type="$(jq -r '.metadata.labels["node.kubernetes.io/instance-type"]' <<<"${info}")"
       nodepool="$(jq -r '.metadata.labels["karpenter.sh/nodepool"] // ""' <<<"${info}")"
+      capacity="$(jq -r '.metadata.labels["karpenter.sh/capacity-type"] // ""' <<<"${info}")"
       efa="$(jq -r '.status.allocatable["vpc.amazonaws.com/efa"] // "0"' <<<"${info}")"
-      if [[ "${nodepool}" == "inference" && "${type}" == "${expected_type}" && "${efa}" -ge "${efa_expected}" && "${efa}" -ge 1 ]]; then
-        ok "cell ${id}: mocker on ${node} (${type}, nodepool=${nodepool}, vpc.amazonaws.com/efa=${efa})"
+      gpus="$(jq -r '.status.allocatable["nvidia.com/gpu"] // "0"' <<<"${info}")"
+      gpu_count="$(jq -r '.metadata.labels["karpenter.k8s.aws/instance-gpu-count"] // "0"' <<<"${info}")"
+      if [[ "${nodepool}" == "inference" && "${type}" == "${expected_type}" && " ${capacity_types} " == *" ${capacity} "* \
+            && "${efa}" -ge "${efa_expected}" && "${efa}" -ge 1 && "${gpus}" -eq "${gpu_count}" ]]; then
+        ok "cell ${id}: ${node} (${type}, ${capacity}, nodepool=${nodepool}, vpc.amazonaws.com/efa=${efa}, nvidia.com/gpu=${gpus})"
       else
-        fail "cell ${id}: ${node} type=${type} nodepool=${nodepool} efa=${efa} (want ${expected_type}, inference, >=${efa_expected})"; rc=1
+        fail "cell ${id}: ${node} type=${type} capacity=${capacity} nodepool=${nodepool} efa=${efa} gpu=${gpus}/${gpu_count} (want ${expected_type}, one of [${capacity_types}], inference, efa>=${efa_expected}, all GPUs allocatable)"; rc=1
       fi
 
       provider="$(jq -r '.spec.providerID' <<<"${info}")"
       instance="${provider##*/}"
-      local cmd out
-      cmd="$(aws ssm send-command --region "${REGION}" --instance-ids "${instance}" \
-        --document-name AWS-RunShellScript --comment "DoD3 SOCI mounts" \
-        --parameters 'commands=["findmnt --source soci"]' --query Command.CommandId --output text)"
-      aws ssm wait command-executed --region "${REGION}" --command-id "${cmd}" --instance-id "${instance}" 2>/dev/null || true
-      out="$(aws ssm get-command-invocation --region "${REGION}" --command-id "${cmd}" --instance-id "${instance}" \
-        --query StandardOutputContent --output text)"
-      if grep -q 'fuse' <<<"${out}"; then
-        ok "cell ${id}: ${instance} has $(grep -c fuse <<<"${out}") SOCI FUSE mounts (lazy-loaded layers)"
+
+      # Phase 1 DoD 3 is lazy loading of the mocker image.
+      if [[ "${ENGINE}" == "stub" && "${soci_mode}" != "lazy" ]]; then
+        fail "cell ${id}: ENGINE=stub expects soci_pull_mode = \"lazy\" (Phase 1 DoD 3), the cell has \"${soci_mode}\""; rc=1
+      fi
+
+      if [[ "${soci_mode}" == "lazy" ]]; then
+        out="$(node_cmd "${instance}" "DoD3 SOCI mounts" 'findmnt --source soci')"
+        if grep -q 'fuse' <<<"${out}"; then
+          ok "cell ${id}: ${instance} has $(grep -c fuse <<<"${out}") SOCI FUSE mounts (lazy-loaded layers)"
+        else
+          fail "cell ${id}: ${instance} has no SOCI mounts"; rc=1
+        fi
       else
-        fail "cell ${id}: ${instance} has no SOCI mounts"; rc=1
+        out="$(node_cmd "${instance}" "DoD3 SOCI parallel pull" \
+          "awk '/^\\[/ { s = (\$0 == \"[pull_modes.parallel_pull_unpack]\") } s && /^enable *=/' /etc/soci-snapshotter-grpc/config.toml; ctr -n k8s.io snapshots --snapshotter soci ls | tail -n +2 | wc -l")"
+        if grep -qxE 'enable *= *true' <<<"${out}" && [[ "$(tail -n1 <<<"${out}")" -ge 1 ]]; then
+          ok "cell ${id}: ${instance} SOCI parallel pull enabled, $(tail -n1 <<<"${out}") snapshots in the soci snapshotter"
+        else
+          fail "cell ${id}: ${instance} SOCI parallel pull not active:"; echo "${out}"; rc=1
+        fi
+      fi
+
+      if [[ "${raid0}" == "true" ]]; then
+        out="$(node_cmd "${instance}" "DoD2 instance-store RAID0" \
+          "grep -E '^md[0-9]+ : active raid0' /proc/mdstat; findmnt -n -o SOURCE --target /var/lib/kubelet")"
+        if grep -q 'active raid0' <<<"${out}" && grep -q '^/dev/md' <<<"$(tail -n1 <<<"${out}")"; then
+          ok "cell ${id}: ${instance} kubelet storage on instance-store RAID0 ($(tail -n1 <<<"${out}"))"
+        else
+          fail "cell ${id}: ${instance} kubelet storage is not on an instance-store RAID0:"; echo "${out}"; rc=1
+        fi
       fi
     done
 
     local frontends
     frontends="$(kc "${ctx}" get pods -n llm-inference \
-      -l nvidia.com/dynamo-graph-deployment-name=stub-engine,nvidia.com/dynamo-component-type=frontend \
+      -l "nvidia.com/dynamo-graph-deployment-name=${ENGINE_DGD},nvidia.com/dynamo-component-type=frontend" \
       --field-selector=status.phase=Running --no-headers | wc -l)"
     if [[ "${frontends}" -ge 1 ]]; then ok "cell ${id}: ${frontends} Dynamo frontend pod(s) running"; else fail "cell ${id}: no frontend"; rc=1; fi
   done
@@ -115,7 +163,7 @@ dod4() {
   first="$(head -n1 <<<"${types}")"
   final="$(tail -n1 <<<"${types}")"
   deltas="$(grep -c '^response.output_text.delta$' <<<"${types}" || true)"
-  # The mocker stops at max_output_tokens, so the terminal event is usually
+  # The mocker and vLLM (short max_output_tokens) stop at the limit, so the terminal event is usually
   # response.incomplete; a model that finishes first sends response.completed.
   if [[ "$(tail -n1 <<<"${data}")" == "data: [DONE]" && "${first}" == "response.created" && "${deltas}" -ge 1 \
         && "${final}" =~ ^response\.(completed|incomplete)$ ]]; then
@@ -153,7 +201,11 @@ dod5() {
 }
 
 dod6() {
-  log "DoD 6: different session-ids (same client) are spread across both cells"
+  log "DoD 6: different session-ids (same client) are spread across all cells"
+  if [[ "$(tf_deploy '.cells | length')" -lt 2 ]]; then
+    ok "single cell: nothing to spread (checked by DoD 5)"
+    return 0
+  fi
   local counts
   counts="$(for i in $(seq 1 20); do served_cell "dod6-${i}-$(date +%s%N)"; done | sort | uniq -c)"
   echo "${counts}"
@@ -196,6 +248,45 @@ dod9() {
   return "${rc}"
 }
 
+dod10() {
+  log "DoD 10: requests are spread over all workers of a cell (Dynamo nvext.worker_id, non-streaming)"
+  [[ "${ENGINE}" == "vllm" ]] || { ok "ENGINE=${ENGINE}: skipped"; return 0; }
+  local rc=0 n_cells want n body workers distinct
+  n_cells="$(tf_deploy '.cells | length')"
+  for id in $(cell_ids); do
+    want="$(kc "$(cell_cluster "${id}")" -n llm-inference get dynamographdeployment "${ENGINE_DGD}" -o json \
+      | jq -r '[.spec.components[] | select(.type == "worker") | .replicas] | add // 0')"
+    n=$((want * 3))
+    workers=""
+    local errors=0 headers worker
+    headers="$(mktemp)"
+    for i in $(seq 1 $((n * n_cells))); do
+      local sid="dod10-${i}-$(date +%s%N)"
+      : >"${headers}"
+      # Single cell: every session lands here. Several cells: keep only this cell's sessions.
+      if ! body="$(curl --silent --show-error --fail --dump-header "${headers}" "${API}/responses" \
+        -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" -H "session-id: ${sid}" \
+        -d "$(jq -nc --arg model "${MODEL}" '{model: $model, input: "hi", max_output_tokens: 4, nvext: {extra_fields: ["worker_id"]}}')")"; then
+        errors=$((errors + 1)); continue
+      fi
+      [[ "$(tr -d '\r' <"${headers}" | awk -F': ' 'tolower($1)=="x-served-cell"{print $2}')" == "${id}" ]] || continue
+      worker="$(jq -r '.nvext.worker_id | (.decode_worker_id // .prefill_worker_id) // empty' <<<"${body}" 2>/dev/null || true)"
+      if [[ -n "${worker}" ]]; then workers+="${worker}"$'\n'; else errors=$((errors + 1)); fi
+    done
+    rm -f "${headers}"
+    distinct="$(grep -v '^$' <<<"${workers}" | sort | uniq -c || true)"
+    echo "${distinct}"
+    if [[ "${errors}" -gt 0 ]]; then
+      fail "cell ${id}: ${errors} request(s) failed or returned no nvext.worker_id"; rc=1
+    elif [[ "$(grep -c . <<<"${distinct}")" -eq "${want}" ]]; then
+      ok "cell ${id}: requests served by all ${want} workers"
+    else
+      fail "cell ${id}: $(grep -c . <<<"${distinct}") of ${want} workers served requests"; rc=1
+    fi
+  done
+  return "${rc}"
+}
+
 ################################################################################
 TOKEN="$(access_token)"
 [[ -n "${TOKEN}" && "${TOKEN}" != "null" ]] || die "could not get a Cognito access token"
@@ -211,6 +302,7 @@ check dod6
 check dod7
 check dod8
 check dod9
+check dod10
 
 echo
 if ((failures == 0)); then ok "all Definition of Done checks passed"; else die "${failures} check group(s) failed"; fi

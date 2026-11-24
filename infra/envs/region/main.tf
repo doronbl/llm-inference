@@ -94,11 +94,13 @@ module "cell" {
   source   = "../../modules/cell"
   for_each = var.cells
 
-  region                  = var.region
-  availability_zone       = each.value.availability_zone
-  cell_id                 = each.key
-  inference_instance_type = each.value.inference_instance_type
-  efa_enabled             = each.value.efa_enabled
+  region                   = var.region
+  availability_zone        = each.value.availability_zone
+  cell_id                  = each.key
+  inference_instance_type  = each.value.inference_instance_type
+  efa_enabled              = each.value.efa_enabled
+  inference_capacity_types = each.value.inference_capacity_types
+  soci_pull_mode           = each.value.soci_pull_mode
 
   name_prefix         = local.name_prefix
   kubernetes_version  = var.kubernetes_version

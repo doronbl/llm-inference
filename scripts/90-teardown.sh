@@ -73,7 +73,9 @@ for id in $(cell_ids); do
   CTX="$(cell_cluster "${id}")"
   reachable "${CTX}" || { fail "cell ${id}: API not reachable, skipping in-cluster cleanup"; continue; }
   log "Cell ${id}: workloads, internal NLB and Karpenter nodes"
-  kc "${CTX}" -n llm-inference delete dynamographdeployment stub-engine --ignore-not-found --wait=true --timeout=10m
+  for dgd in ${ALL_ENGINE_DGDS}; do
+    kc "${CTX}" -n llm-inference delete dynamographdeployment "${dgd}" --ignore-not-found --wait=true --timeout=10m
+  done
   # Deleting the Service makes the controller delete the NLB and its security groups.
   kc "${CTX}" -n llm-inference delete service frontend-nlb --ignore-not-found --wait=true --timeout=10m
   # Deleting the NodePool terminates its instances; deleting the EC2NodeClass

@@ -1,7 +1,8 @@
 # Internal NLB in front of the Dynamo frontend of this cell, created by the AWS
 # Load Balancer Controller (IP targets, cell subnet only). The regional router
 # reaches it at http://<nlb-dns-name>:8000.
-# Rendered per cell by scripts/50-stub-engine.sh (envsubst).
+# Rendered per cell by scripts/50-engine.sh (envsubst). ENGINE_DGD is the
+# DynamoGraphDeployment of the selected engine (vllm-engine or stub-engine).
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,7 +26,7 @@ spec:
   loadBalancerSourceRanges:
     - ${VPC_CIDR}
   selector:
-    nvidia.com/dynamo-graph-deployment-name: stub-engine
+    nvidia.com/dynamo-graph-deployment-name: ${ENGINE_DGD}
     nvidia.com/dynamo-component-type: frontend
   ports:
     - name: http

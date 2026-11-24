@@ -13,6 +13,26 @@ export KUBECONFIG="${KUBECONFIG_FILE:-${STATE_DIR}/kubeconfig}"
 # shellcheck source=versions.env
 source "${SCRIPTS_DIR}/versions.env"
 
+# Engine deployed in the cells by scripts/50-engine.sh:
+#   vllm  vLLM workers on GPU nodes (workloads/vllm/), the default
+#   stub  Dynamo mocker on CPU nodes (workloads/stub-engine/), Phase 1
+# scripts/50-engine.sh records the engine it deployed in ${STATE_DIR}/engine.
+# Without ENGINE in the environment, every script uses that recorded engine,
+# so a later run (step 6 again, verify, teardown) never switches engines by
+# accident. Set ENGINE explicitly to switch.
+ENGINE_STATE_FILE="${STATE_DIR}/engine"
+if [[ -z "${ENGINE:-}" && -s "${ENGINE_STATE_FILE}" ]]; then
+  ENGINE="$(<"${ENGINE_STATE_FILE}")"
+fi
+ENGINE="${ENGINE:-vllm}"
+case "${ENGINE}" in
+  vllm) ENGINE_DGD="vllm-engine"; ENGINE_DIR="${REPO_ROOT}/workloads/vllm" ;;
+  stub) ENGINE_DGD="stub-engine"; ENGINE_DIR="${REPO_ROOT}/workloads/stub-engine" ;;
+  *) echo "ENGINE must be vllm or stub (got: ${ENGINE})" >&2; exit 1 ;;
+esac
+# Every DynamoGraphDeployment name scripts/50-engine.sh can create (teardown).
+ALL_ENGINE_DGDS="vllm-engine stub-engine"
+
 mkdir -p "${STATE_DIR}"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
